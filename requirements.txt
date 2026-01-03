@@ -1,0 +1,29 @@
+# Flask Web Framework
+Flask>=3.0.0
+flask-cors>=4.0.0
+
+# Database
+mysql-connector-python>=8.2.0
+
+# Computer Vision & Image Processing
+opencv-python-headless>=4.10.0
+numpy>=1.26.0
+Pillow>=10.3.0
+
+# Machine Learning
+roboflow>=1.1.0
+
+# MQTT Client
+paho-mqtt>=1.6.0
+
+# HTTP Requests
+requests>=2.31.0
+
+# JSON & Data
+jsonschema>=4.19.0
+
+# Environment Variables
+python-dotenv>=1.0.0
+
+# Production Server (WAJIB untuk Railway)
+gunicorn>=21.2.0
