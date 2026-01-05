@@ -23,5 +23,5 @@ COPY . .
 # Expose port (Railway will set $PORT dynamically)
 EXPOSE 8080
 
-# Start application with gunicorn
-CMD gunicorn app:app --bind 0.0.0.0:$PORT --workers 2 --timeout 120 --log-level info --access-logfile - --error-logfile -
+# Start application with gunicorn - use PORT env or default to 8080
+CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 120 --log-level info --access-logfile - --error-logfile -
