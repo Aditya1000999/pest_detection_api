@@ -1,4 +1,3 @@
-import tempfile
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import mysql.connector
@@ -64,6 +63,18 @@ esp32_status = {
     'ldr_value': 0,
     'total_captures': 0
 }
+_initialized = False  # Track initialization status
+
+def ensure_initialized():
+    """Lazy initialization - hanya dijalankan saat ada request pertama"""
+    global _initialized
+    if not _initialized:
+        print("\n🚀 First request received - initializing components...")
+        init_database()
+        init_roboflow()
+        init_mqtt()
+        _initialized = True
+        print("✅ Components initialized!\n")
 
 # ===== DATABASE FUNCTIONS =====
 def get_db_connection():
@@ -357,9 +368,7 @@ def detect_pests_roboflow(image_base64):
             return []
         
         # Save temporary file
-        import tempfile
-        temp_dir = os.environ.get('TEMP', tempfile.gettempdir())
-        temp_path = os.path.join(temp_dir, "temp_detection.jpg")
+        temp_path = "/tmp/temp_detection.jpg"
         cv2.imwrite(temp_path, img)
         
         # Run detection
