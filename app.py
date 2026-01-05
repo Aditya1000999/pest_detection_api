@@ -1,5 +1,3 @@
-# hahahahhahahahahaahahahahahahahahahahahahahahahahahahahahahahahahahahahahahahahahahaha
-
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import mysql.connector
@@ -335,7 +333,6 @@ def init_roboflow():
         print(f"   Model: {ROBOFLOW_PROJECT}")
         print(f"   Confidence: {CONFIDENCE_THRESHOLD}%")
         print(f"   Pest Types: {len(PEST_NAMES)}")
-        print(f"   Pests: {', '.join(PEST_NAMES.values())}")
         return True
         
     except Exception as e:
@@ -809,43 +806,54 @@ def get_stats():
         print(f"❌ Error /api/stats: {e}")
         return jsonify({'error': str(e)}), 500
 
+# ===== INITIALIZE ON STARTUP =====
+print("\n" + "="*60)
+print("  🐛 PEST DETECTION API WITH MQTT")
+print("  8 Rice Pest Types Detection System")
+print("="*60)
+
+# Initialize components
+print("\n📦 Initializing components...")
+init_database()
+init_roboflow()
+init_mqtt()
+
+print("\n" + "="*60)
+print("  ✅ API READY!")
+print("="*60)
+
+print(f"\n🐛 Pest Types ({len(PEST_NAMES)}):")
+for i, (key, name) in enumerate(PEST_NAMES.items(), 1):
+    print(f"   {i}. {name}")
+
+print(f"\n📡 MQTT Topics:")
+print(f"   Subscribe:")
+print(f"     • {TOPIC_IMAGE} (ESP32 → API)")
+print(f"     • {TOPIC_STATUS} (ESP32 → API)")
+print(f"   Publish:")
+print(f"     • {TOPIC_COMMAND} (API → ESP32)")
+
+print(f"\n🌐 REST API Endpoints:")
+print(f"   • POST   /api/trigger-capture  - Trigger manual capture")
+print(f"   • GET    /data                 - Get latest detection")
+print(f"   • GET    /api/history          - Get detection history")
+print(f"   • POST   /control              - System on/off")
+print(f"   • DELETE /api/delete/<id>      - Delete detection")
+print(f"   • GET    /ping                 - Health check")
+print(f"   • GET    /api/mqtt-status      - MQTT & ESP32 status")
+print(f"   • GET    /api/stats            - Detection statistics")
+print("="*60 + "\n")
+
+print("🚀 Starting application...")
+print("   Mode: Production (Gunicorn)")
+print("   Workers: 2")
+print("   Timeout: 120s")
+print("")
+
 if __name__ == '__main__':
-    print("\n" + "="*60)
-    print("  🐛 PEST DETECTION API WITH MQTT")
-    print("  8 Rice Pest Types Detection System")
-    print("="*60)
-    
-    # Initialize components
-    print("\n📦 Initializing components...")
-    init_database()
-    init_roboflow()
-    init_mqtt()
-    
-    print("\n" + "="*60)
-    print("  ✅ API READY!")
-    print("="*60)
-    
-    print(f"\n🐛 Pest Types ({len(PEST_NAMES)}):")
-    for i, (key, name) in enumerate(PEST_NAMES.items(), 1):
-        print(f"   {i}. {name}")
-    
-    print(f"\n📡 MQTT Topics:")
-    print(f"   Subscribe:")
-    print(f"     • {TOPIC_IMAGE} (ESP32 → API)")
-    print(f"     • {TOPIC_STATUS} (ESP32 → API)")
-    print(f"   Publish:")
-    print(f"     • {TOPIC_COMMAND} (API → ESP32)")
-    
-    print(f"\n🌐 REST API Endpoints:")
-    print(f"   • POST   /api/trigger-capture")
-    print(f"   • GET    /data")
-    print(f"   • GET    /api/history")
-    print(f"   • POST   /control")
-    print(f"   • DELETE /api/delete/<id>")
-    print(f"   • GET    /ping")
-    print(f"   • GET    /api/mqtt-status")
-    print(f"   • GET    /api/stats")
-    print("="*60 + "\n")
-    
-    app.run(host='0.0.0.0', port=5000, debug=True)
-    print(f"\n🚪 Shutting down API...")
+    # Hanya untuk local testing
+    port = int(os.environ.get('PORT', 5000))
+    print(f"⚠️  Running in development mode on port {port}")
+    print("   For production, use: gunicorn app:app")
+    print("")
+    app.run(host='0.0.0.0', port=port, debug=False)
