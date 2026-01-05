@@ -1,3 +1,4 @@
+import tempfile
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import mysql.connector
@@ -356,7 +357,9 @@ def detect_pests_roboflow(image_base64):
             return []
         
         # Save temporary file
-        temp_path = "/tmp/temp_detection.jpg"
+        import tempfile
+        temp_dir = os.environ.get('TEMP', tempfile.gettempdir())
+        temp_path = os.path.join(temp_dir, "temp_detection.jpg")
         cv2.imwrite(temp_path, img)
         
         # Run detection

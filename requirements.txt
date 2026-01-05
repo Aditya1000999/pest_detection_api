@@ -2,13 +2,13 @@
 Flask==3.0.0
 flask-cors==4.0.0
 
-# Production WSGI Server (WAJIB untuk Railway)
+# Production WSGI Server
 gunicorn==21.2.0
 
 # Database
 mysql-connector-python==8.2.0
 
-# Computer Vision & Image Processing
+# Computer Vision & Image Processing (pakai headless untuk server)
 opencv-python-headless==4.8.1.78
 numpy==1.24.3
 Pillow==10.1.0
@@ -24,3 +24,7 @@ requests==2.31.0
 
 # Environment Variables
 python-dotenv==1.0.0
+
+# Untuk Railway compatibility
+setuptools==69.0.0
+wheel==0.42.0
