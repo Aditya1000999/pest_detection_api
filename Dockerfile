@@ -20,8 +20,11 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy application code
 COPY . .
 
-# Expose port (Railway will set $PORT dynamically)
+# Expose port
 EXPOSE 8080
 
-# Start application with gunicorn - use PORT env or default to 8080
-CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8080} --workers 2 --timeout 120 --log-level info --access-logfile - --error-logfile -
+# Set PORT environment variable
+ENV PORT=8080
+
+# Start application with gunicorn
+CMD gunicorn app:app --bind 0.0.0.0:8080 --workers 2 --timeout 120 --log-level info --access-logfile - --error-logfile -
