@@ -37,6 +37,7 @@ MQTT_CLIENT_ID = "pest_detection_api"
 TOPIC_IMAGE = "pest/image"
 TOPIC_STATUS = "pest/status"
 TOPIC_COMMAND = "pest/command"
+TOPIC_DETECTION = "pest/detection"  # ✅ TAMBAH TOPIC BARU
 
 # ===== KONFIGURASI ROBOFLOW =====
 ROBOFLOW_API_KEY = os.environ.get('ROBOFLOW_API_KEY', 'Frwruit34mrF3dLM4AtX')
@@ -57,6 +58,7 @@ PEST_NAMES = {
 
 # ===== GLOBAL VARIABLES =====
 sent_image_ids = set()
+sent_image_ids_lock = threading.Lock()  # ✅ Thread-safe lock
 roboflow_model = None
 mqtt_client = None
 mqtt_connected = False
@@ -66,18 +68,6 @@ esp32_status = {
     'ldr_value': 0,
     'total_captures': 0
 }
-_initialized = False  # Track initialization status
-
-def ensure_initialized():
-    """Lazy initialization - hanya dijalankan saat ada request pertama"""
-    global _initialized
-    if not _initialized:
-        print("\n🚀 First request received - initializing components...")
-        init_database()
-        init_roboflow()
-        init_mqtt()
-        _initialized = True
-        print("✅ Components initialized!\n")
 
 # ===== DATABASE FUNCTIONS =====
 def get_db_connection():
@@ -188,10 +178,12 @@ def on_connect(client, userdata, flags, rc):
         # Subscribe ke topics
         client.subscribe(TOPIC_IMAGE, qos=1)
         client.subscribe(TOPIC_STATUS, qos=1)
+        client.subscribe(TOPIC_DETECTION, qos=1)  # ✅ TAMBAH TOPIC DETECTION
         
         print(f"📡 Subscribed to:")
         print(f"   • {TOPIC_IMAGE}")
         print(f"   • {TOPIC_STATUS}")
+        print(f"   • {TOPIC_DETECTION}")  # ✅ TAMBAH LOG
     else:
         print(f"❌ MQTT Connection failed with code {rc}")
         mqtt_connected = False
@@ -208,24 +200,37 @@ def on_disconnect(client, userdata, rc):
 def on_message(client, userdata, msg):
     """Callback saat menerima message dari MQTT"""
     topic = msg.topic
-    payload = msg.payload.decode('utf-8')
-    
-    print(f"\n📨 MQTT Message Received:")
-    print(f"   Topic: {topic}")
-    print(f"   Size: {len(payload)} bytes")
     
     try:
+        # Handle binary payload dengan error handling
+        try:
+            payload = msg.payload.decode('utf-8')
+        except UnicodeDecodeError:
+            print(f"❌ Cannot decode payload as UTF-8")
+            return
+        
+        print(f"\n📨 MQTT Message Received:")
+        print(f"   Topic: {topic}")
+        print(f"   Size: {len(payload)} bytes")
+        
         data = json.loads(payload)
         
         if topic == TOPIC_IMAGE:
             handle_image_message(data)
         elif topic == TOPIC_STATUS:
             handle_status_message(data)
+        elif topic == TOPIC_DETECTION:  # ✅ HANDLE DETECTION TOPIC
+            handle_detection_message(data)
+        else:
+            print(f"   ⚠️ Unknown topic: {topic}")
             
     except json.JSONDecodeError as e:
         print(f"❌ JSON decode error: {e}")
+        print(f"   Payload preview: {payload[:200] if len(payload) > 200 else payload}")
     except Exception as e:
         print(f"❌ Error handling message: {e}")
+        import traceback
+        traceback.print_exc()
 
 def handle_image_message(data):
     """Handle image message dari ESP32"""
@@ -244,7 +249,11 @@ def handle_image_message(data):
     # Deteksi hama
     predictions = detect_pests_roboflow(image_base64)
     
-    if not predictions or len(predictions) == 0:
+    if predictions is None:
+        print("   ❌ Detection error - skipping save")
+        return
+    
+    if len(predictions) == 0:
         print("   ✅ No pests detected - not saving")
         return
     
@@ -274,6 +283,53 @@ def handle_status_message(data):
     print(f"     • LDR: {esp32_status['ldr_value']}")
     print(f"     • Light OK: {esp32_status['light_ok']}")
     print(f"     • Captures: {esp32_status['total_captures']}")
+
+def handle_detection_message(data):
+    """
+    ✅ HANDLE TOPIC pest/detection
+    
+    Format yang diterima dari MQTTX untuk testing:
+    {
+        "detection_time": "2026-01-07 10:30:00",
+        "image_base64": "base64_string...",
+        "total_pests_found": 3,
+        "pest_details": [
+            {
+                "pest_type": "wereng",
+                "pest_name_id": "Wereng Daun",
+                "confidence": 0.95,
+                "x": 100,
+                "y": 150,
+                "width": 200,
+                "height": 250
+            }
+        ],
+        "max_confidence": 0.95
+    }
+    """
+    print(f"   Type: DETECTION (Direct Save)")
+    
+    image_base64 = data.get('image_base64', '')
+    detection_time = data.get('detection_time', None)
+    total_pests = data.get('total_pests_found', 0)
+    pest_details = data.get('pest_details', [])
+    max_confidence = data.get('max_confidence', 0)
+    
+    if not image_base64:
+        print("   ⚠️ No image data")
+        return
+    
+    if not pest_details or len(pest_details) == 0:
+        print("   ⚠️ No pest details provided")
+        return
+    
+    print(f"   Detection Time: {detection_time}")
+    print(f"   Total Pests: {total_pests}")
+    print(f"   Max Confidence: {max_confidence}")
+    print(f"   🐛 Saving {len(pest_details)} pests to database...")
+    
+    # Langsung save ke database tanpa Roboflow detection
+    save_detection_to_db_direct(image_base64, pest_details, detection_time, max_confidence)
 
 # ===== MQTT CLIENT SETUP =====
 def init_mqtt():
@@ -366,7 +422,8 @@ def detect_pests_roboflow(image_base64):
     global roboflow_model
     
     if roboflow_model is None:
-        return []
+        print("❌ Roboflow model not initialized")
+        return None  # Return None untuk indicate error
     
     try:
         # Decode base64 to image
@@ -375,7 +432,8 @@ def detect_pests_roboflow(image_base64):
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
-            return []
+            print("❌ Failed to decode image")
+            return None
         
         # Save temporary file
         temp_path = "/tmp/temp_detection.jpg"
@@ -392,10 +450,12 @@ def detect_pests_roboflow(image_base64):
         
     except Exception as e:
         print(f"❌ Detection error: {e}")
-        return []
+        import traceback
+        traceback.print_exc()
+        return None
 
 def save_detection_to_db(image_base64, predictions):
-    """Simpan hasil deteksi ke database"""
+    """Simpan hasil deteksi dari Roboflow ke database"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -478,6 +538,93 @@ def save_detection_to_db(image_base64, predictions):
         
     except Exception as e:
         print(f"❌ Database save error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def save_detection_to_db_direct(image_base64, pest_details, detection_time=None, max_confidence=None):
+    """
+    ✅ Simpan deteksi langsung ke database (tanpa Roboflow)
+    Untuk data yang sudah dideteksi dari MQTTX atau external source
+    """
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        
+        cursor = conn.cursor()
+        
+        # Calculate max confidence jika tidak diberikan
+        if max_confidence is None:
+            max_confidence = max([float(p.get('confidence', 0)) for p in pest_details], default=0)
+        
+        # Insert ke detection_summary
+        if detection_time:
+            cursor.execute("""
+                INSERT INTO detection_summary 
+                (detection_time, image_base64, total_pests_found, pest_details, max_confidence)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (
+                detection_time,
+                image_base64,
+                len(pest_details),
+                json.dumps(pest_details),
+                float(max_confidence)
+            ))
+        else:
+            cursor.execute("""
+                INSERT INTO detection_summary 
+                (image_base64, total_pests_found, pest_details, max_confidence)
+                VALUES (%s, %s, %s, %s)
+            """, (
+                image_base64,
+                len(pest_details),
+                json.dumps(pest_details),
+                float(max_confidence)
+            ))
+        
+        summary_id = cursor.lastrowid
+        
+        # Insert detail deteksi
+        for det in pest_details:
+            cursor.execute("""
+                INSERT INTO detections 
+                (summary_id, pest_type, pest_name_id, confidence, 
+                 location_x, location_y, width, height, total_pests)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                summary_id,
+                det.get('pest_type', 'unknown'),
+                det.get('pest_name_id', 'Unknown Pest'),
+                float(det.get('confidence', 0)),
+                int(det.get('x', 0)),
+                int(det.get('y', 0)),
+                int(det.get('width', 0)),
+                int(det.get('height', 0)),
+                len(pest_details)
+            ))
+        
+        # Update system status
+        cursor.execute("""
+            UPDATE system_status 
+            SET total_detections = total_detections + 1,
+                last_update = NOW()
+            WHERE id = 1
+        """)
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print(f"✅ Saved to database: ID={summary_id}, Pests={len(pest_details)}")
+        pest_names = [d.get('pest_name_id', 'Unknown') for d in pest_details]
+        print(f"   Detected: {', '.join(pest_names)}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Database save error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 # ===== REST API ENDPOINTS =====
@@ -523,23 +670,24 @@ def get_data():
             status = {'system_active': True, 'total_detections': 0}
         
         # Get latest detection
-        if sent_image_ids:
-            placeholders = ','.join(['%s'] * len(sent_image_ids))
-            query = f"""
-                SELECT id, detection_time, image_base64, max_confidence,
-                       total_pests_found, pest_details
-                FROM detection_summary
-                WHERE id NOT IN ({placeholders})
-                ORDER BY detection_time DESC LIMIT 1
-            """
-            cursor.execute(query, tuple(sent_image_ids))
-        else:
-            cursor.execute("""
-                SELECT id, detection_time, image_base64, max_confidence,
-                       total_pests_found, pest_details
-                FROM detection_summary
-                ORDER BY detection_time DESC LIMIT 1
-            """)
+        with sent_image_ids_lock:  # ✅ Thread-safe access
+            if sent_image_ids:
+                placeholders = ','.join(['%s'] * len(sent_image_ids))
+                query = f"""
+                    SELECT id, detection_time, image_base64, max_confidence,
+                           total_pests_found, pest_details
+                    FROM detection_summary
+                    WHERE id NOT IN ({placeholders})
+                    ORDER BY detection_time DESC LIMIT 1
+                """
+                cursor.execute(query, tuple(sent_image_ids))
+            else:
+                cursor.execute("""
+                    SELECT id, detection_time, image_base64, max_confidence,
+                           total_pests_found, pest_details
+                    FROM detection_summary
+                    ORDER BY detection_time DESC LIMIT 1
+                """)
         
         latest = cursor.fetchone()
         
@@ -593,25 +741,29 @@ def get_data():
         }
         
         # Send new detection if available
-        if latest and latest['id'] not in sent_image_ids:
-            response['newDetection'] = True
-            response['motion'] = True
-            response['image'] = latest['image_base64']
-            response['id'] = latest['id']
-            response['confidence'] = int(float(latest['max_confidence']) * 100) if latest['max_confidence'] else 85
-            response['pestNames'] = pest_names
-            response['pestName'] = ', '.join(pest_names) if pest_names else 'Unknown Pest'
-            
-            sent_image_ids.add(latest['id'])
-            
-            if len(sent_image_ids) > 100:
-                sorted_ids = sorted(sent_image_ids)
-                sent_image_ids -= set(sorted_ids[:50])
+        if latest:
+            with sent_image_ids_lock:  # ✅ Thread-safe access
+                if latest['id'] not in sent_image_ids:
+                    response['newDetection'] = True
+                    response['motion'] = True
+                    response['image'] = latest['image_base64']
+                    response['id'] = latest['id']
+                    response['confidence'] = int(float(latest['max_confidence']) * 100) if latest['max_confidence'] else 85
+                    response['pestNames'] = pest_names
+                    response['pestName'] = ', '.join(pest_names) if pest_names else 'Unknown Pest'
+                    
+                    sent_image_ids.add(latest['id'])
+                    
+                    if len(sent_image_ids) > 100:
+                        sorted_ids = sorted(sent_image_ids)
+                        sent_image_ids -= set(sorted_ids[:50])
         
         return jsonify(response), 200
         
     except Exception as e:
         print(f"❌ Error /data: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/history', methods=['GET'])
@@ -668,6 +820,8 @@ def get_history():
         
     except Exception as e:
         print(f"❌ Error /api/history: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/control', methods=['POST'])
@@ -732,8 +886,8 @@ def delete_detection(summary_id):
         cursor.close()
         conn.close()
         
-        global sent_image_ids
-        sent_image_ids.discard(summary_id)
+        with sent_image_ids_lock:  # ✅ Thread-safe access
+            sent_image_ids.discard(summary_id)
         
         return jsonify({'success': True}), 200
         
@@ -861,6 +1015,7 @@ print(f"\n📡 MQTT Topics:")
 print(f"   Subscribe:")
 print(f"     • {TOPIC_IMAGE} (ESP32 → API)")
 print(f"     • {TOPIC_STATUS} (ESP32 → API)")
+print(f"     • {TOPIC_DETECTION} (MQTTX/Test → API)")  # ✅ TAMBAH
 print(f"   Publish:")
 print(f"     • {TOPIC_COMMAND} (API → ESP32)")
 
@@ -885,6 +1040,6 @@ if __name__ == '__main__':
     # Hanya untuk local testing
     port = int(os.environ.get('PORT', 5000))
     print(f"⚠️  Running in development mode on port {port}")
-    print("   For production, use: gunicorn app:app")
+    print(f"   For production, use: gunicorn app:app")
     print("")
     app.run(host='0.0.0.0', port=port, debug=False)
