@@ -16,11 +16,11 @@ CORS(app)
 
 # ===== KONFIGURASI DATABASE RAILWAY =====
 DB_CONFIG = {
-    'host': os.environ.get('MYSQLHOST', 'mysql.railway.internal'),
+    'host': os.environ['MYSQLHOST'],
     'port': int(os.environ.get('MYSQLPORT', 3306)),
-    'user': os.environ.get('MYSQLUSER', 'root'),
-    'password': os.environ.get('MYSQL_ROOT_PASSWORD', ''),
-    'database': os.environ.get('MYSQL_DATABASE', 'railway')
+    'user': os.environ['MYSQLUSER'],
+    'password': os.environ['MYSQLPASSWORD'],  # WAJIB ADA
+    'database': os.environ['MYSQLDATABASE']
 }
 
 # ===== KONFIGURASI MQTT =====
@@ -733,16 +733,25 @@ def delete_detection(summary_id):
 
 @app.route('/ping', methods=['GET'])
 def ping():
-    """Health check"""
+    db_ok = False
+    try:
+        conn = get_db_connection()
+        if conn:
+            db_ok = True
+            conn.close()
+    except:
+        db_ok = False
+
     return jsonify({
         'status': 'online',
+        'database': 'connected' if db_ok else 'error',
         'timestamp': datetime.now().isoformat(),
         'mqtt_connected': mqtt_connected,
         'roboflow_ready': roboflow_model is not None,
         'esp32_online': esp32_status['online'],
-        'database': 'railway',
         'pest_types': len(PEST_NAMES)
     }), 200
+
 
 @app.route('/api/mqtt-status', methods=['GET'])
 def mqtt_status():
