@@ -27,7 +27,7 @@ DB_CONFIG = {
 }
 
 # ===== KONFIGURASI MQTT =====
-MQTT_BROKER = os.environ.get('MQTT_BROKER', 'broker.hivemq.com')
+MQTT_BROKER = os.environ.get('MQTT_BROKER', 'a96a40f3763c4eb99b42e2ed2bc5efdd.s1.eu.hivemq.cloud')
 MQTT_PORT = int(os.environ.get('MQTT_PORT', 8883))
 MQTT_USERNAME = os.environ.get('MQTT_USERNAME', '')
 MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD', '')
