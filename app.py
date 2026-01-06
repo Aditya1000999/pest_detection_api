@@ -10,6 +10,8 @@ from roboflow import Roboflow
 import paho.mqtt.client as mqtt
 import threading
 import os
+import uuid
+
 
 app = Flask(__name__)
 CORS(app)
@@ -274,35 +276,32 @@ def handle_status_message(data):
 
 # ===== MQTT CLIENT SETUP =====
 def init_mqtt():
-    """Initialize MQTT client"""
     global mqtt_client
-    
-    print("\n🔌 Initializing MQTT Client...")
-    print(f"   Broker: {MQTT_BROKER}:{MQTT_PORT}")
-    
-    mqtt_client = mqtt.Client(client_id=MQTT_CLIENT_ID)
+
+    print("🔌 Initializing MQTT...")
+
+    client_id = f"pest-api-{uuid.uuid4()}"
+    print(f"🆔 MQTT CLIENT ID: {client_id}")
+
+    mqtt_client = mqtt.Client(
+        client_id=client_id,
+        clean_session=True
+    )
+
+    mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
     mqtt_client.on_connect = on_connect
     mqtt_client.on_disconnect = on_disconnect
     mqtt_client.on_message = on_message
-    
-    # Set username/password jika ada
-    if MQTT_USERNAME and MQTT_PASSWORD:
-        mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-        print(f"   Auth: Enabled (user: {MQTT_USERNAME})")
-    
-    try:
-        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-        
-        # Start loop in background thread
-        mqtt_thread = threading.Thread(target=mqtt_client.loop_forever, daemon=True)
-        mqtt_thread.start()
-        
-        print("✅ MQTT Client started in background")
-        return True
-        
-    except Exception as e:
-        print(f"❌ MQTT Connection error: {e}")
-        return False
+
+    mqtt_client.reconnect_delay_set(min_delay=2, max_delay=10)
+
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+
+    mqtt_client.loop_start()
+
+    print("✅ MQTT client started")
+
 
 def publish_command(command):
     """Publish command ke ESP32 via MQTT"""
