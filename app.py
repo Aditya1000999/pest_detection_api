@@ -11,6 +11,7 @@ import paho.mqtt.client as mqtt
 import threading
 import os
 import uuid
+import ssl
 
 
 app = Flask(__name__)
@@ -285,10 +286,20 @@ def init_mqtt():
 
     mqtt_client = mqtt.Client(
         client_id=client_id,
-        clean_session=True
+        protocol=mqtt.MQTTv311
     )
 
-    mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    # Username & password HiveMQ
+    mqtt_client.username_pw_set(
+        MQTT_USERNAME,
+        MQTT_PASSWORD
+    )
+
+    # 🔐 WAJIB UNTUK PORT 8883 (HiveMQ Cloud)
+    mqtt_client.tls_set(
+        tls_version=ssl.PROTOCOL_TLS_CLIENT
+    )
+    mqtt_client.tls_insecure_set(False)
 
     mqtt_client.on_connect = on_connect
     mqtt_client.on_disconnect = on_disconnect
@@ -296,10 +307,10 @@ def init_mqtt():
 
     mqtt_client.reconnect_delay_set(min_delay=2, max_delay=10)
 
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    print(f"🌐 Connecting to MQTT {MQTT_BROKER}:{MQTT_PORT} (TLS)")
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
 
     mqtt_client.loop_start()
-
     print("✅ MQTT client started")
 
 
