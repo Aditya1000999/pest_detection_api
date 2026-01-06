@@ -14,13 +14,13 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-# ===== KONFIGURASI DATABASE RAILWAY =====
+
 DB_CONFIG = {
-    'host': os.environ['MYSQLHOST'],
-    'port': int(os.environ.get('MYSQLPORT', 3306)),
-    'user': os.environ['MYSQLUSER'],
-    'password': os.environ['MYSQLPASSWORD'],  # WAJIB ADA
-    'database': os.environ['MYSQLDATABASE']
+    "host": os.environ.get("MYSQLHOST", "mysql.railway.internal"),
+    "port": int(os.environ.get("MYSQLPORT", 3306)),
+    "user": os.environ.get("MYSQLUSER", "root"),
+    "password": os.environ.get("MYSQLPASSWORD", "pkcjdgpmRJGsfHeioDCWgFgFsVIOJDbb"),
+    "database": os.environ.get("MYSQLDATABASE", "railway"),
 }
 
 # ===== KONFIGURASI MQTT =====
