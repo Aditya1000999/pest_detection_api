@@ -27,7 +27,7 @@ DB_CONFIG = {
 
 # ===== KONFIGURASI MQTT =====
 MQTT_BROKER = os.environ.get('MQTT_BROKER', 'broker.hivemq.com')
-MQTT_PORT = int(os.environ.get('MQTT_PORT', 1883))
+MQTT_PORT = int(os.environ.get('MQTT_PORT', 8883))
 MQTT_USERNAME = os.environ.get('MQTT_USERNAME', '')
 MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD', '')
 MQTT_CLIENT_ID = "pest_detection_api"
