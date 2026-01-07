@@ -18,6 +18,15 @@ import time
 app = Flask(__name__)
 CORS(app)
 
+# ===== SET TIMEZONE =====
+# Set environment timezone to WIB
+import os
+os.environ['TZ'] = 'Asia/Jakarta'
+try:
+    time.tzset()  # Apply timezone (Unix only)
+except AttributeError:
+    pass  # Windows doesn't have tzset
+
 # ===== TIMEZONE CONFIGURATION =====
 # Indonesia WIB (GMT+7)
 WIB_OFFSET = timedelta(hours=7)
@@ -30,6 +39,7 @@ DB_CONFIG = {
     "user": os.environ.get("MYSQLUSER", "root"),
     "password": os.environ.get("MYSQLPASSWORD", "pkcjdgpmRJGsfHeioDCWgFgFsVIOJDbb"),
     "database": os.environ.get("MYSQLDATABASE", "railway"),
+    "time_zone": "+07:00"  # ✅ SET TIMEZONE WIB
 }
 
 # ===== KONFIGURASI MQTT =====
@@ -84,6 +94,12 @@ chunk_storage = {}
 chunk_storage_lock = threading.Lock()
 
 # ===== TIMESTAMP HELPER =====
+def get_current_wib_time():
+    """Get current time in WIB timezone"""
+    utc_now = datetime.utcnow()
+    wib_now = utc_now + WIB_OFFSET
+    return wib_now
+
 def format_detection_time(dt):
     """Format detection_time dari database ke string"""
     if dt is None:
@@ -440,7 +456,7 @@ def handle_status_message(data):
     
     esp32_status = {
         'online': data.get('online', False),
-        'last_seen': datetime.now(),
+        'last_seen': get_current_wib_time(),  # ✅ WIB time
         'ldr_value': data.get('ldr_value', 0),
         'light_ok': data.get('light_ok', False),
         'total_captures': data.get('total_captures', 0),
@@ -725,8 +741,8 @@ def save_detection_to_db_with_timestamp(image_base64, predictions, timestamp_val
         
         # If no valid timestamp, use current time
         if not detection_time:
-            detection_time = datetime.now()
-            print(f"   📅 Using current time: {detection_time}")
+            detection_time = get_current_wib_time()  # ✅ WIB time
+            print(f"   📅 Using current WIB time: {detection_time}")
         
         # Insert with timestamp
         cursor.execute("""
@@ -816,13 +832,13 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
                         print(f"   📅 Parsed datetime string: {detection_time}")
                     except ValueError:
                         # If parsing fails, use current time
-                        converted_time = datetime.now()
-                        print(f"   ⚠️ Parse failed, using current time")
+                        converted_time = get_current_wib_time()  # ✅ WIB time
+                        print(f"   ⚠️ Parse failed, using current WIB time")
                         
             except (ValueError, OSError) as e:
                 # Invalid timestamp, use current time
-                converted_time = datetime.now()
-                print(f"   ⚠️ Timestamp error: {e}, using current time")
+                converted_time = get_current_wib_time()  # ✅ WIB time
+                print(f"   ⚠️ Timestamp error: {e}, using current WIB time")
         
         if converted_time:
             cursor.execute("""
@@ -989,7 +1005,7 @@ def get_data():
             'lastDetection': format_detection_time(last_record['detection_time']) if last_record else '-',
             'systemActive': bool(status['system_active']),
             'newDetection': False,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'timestamp': get_current_wib_time().strftime('%Y-%m-%d %H:%M:%S'),  # ✅ WIB time
             'confidence': 85,
             'pestName': 'Unknown',
             'pestNames': [],
@@ -1169,7 +1185,8 @@ def ping():
     return jsonify({
         'status': 'online',
         'database': 'connected' if db_ok else 'error',
-        'timestamp': datetime.now().isoformat(),
+        'timestamp': get_current_wib_time().isoformat(),  # ✅ WIB time
+        'timezone': 'Asia/Jakarta (WIB/GMT+7)',
         'mqtt_connected': mqtt_connected,
         'mqtt_client_id': MQTT_CLIENT_ID,
         'roboflow_ready': roboflow_model is not None,
