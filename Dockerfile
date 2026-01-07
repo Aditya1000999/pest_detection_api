@@ -26,5 +26,6 @@ EXPOSE 8080
 # Set PORT environment variable
 ENV PORT=8080
 
-# Start application with gunicorn
-CMD gunicorn app:app --bind 0.0.0.0:8080 --workers 2 --timeout 120 --log-level info --access-logfile - --error-logfile -
+# ✅ UBAH --workers 2 MENJADI --workers 1
+# Start application with gunicorn (single worker for MQTT compatibility)
+CMD gunicorn app:app --bind 0.0.0.0:8080 --workers 1 --timeout 120 --log-level info --access-logfile - --error-logfile -

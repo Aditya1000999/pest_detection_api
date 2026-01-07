@@ -12,6 +12,7 @@ import threading
 import os
 import uuid
 import ssl
+import time
 
 
 app = Flask(__name__)
@@ -31,20 +32,20 @@ MQTT_BROKER = os.environ.get('MQTT_BROKER', 'a96a40f3763c4eb99b42e2ed2bc5efdd.s1
 MQTT_PORT = int(os.environ.get('MQTT_PORT', 8883))
 MQTT_USERNAME = os.environ.get('MQTT_USERNAME', 'wormteam')
 MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD', 'Worm.1212')
-MQTT_CLIENT_ID = "pest_detection_api"
+MQTT_CLIENT_ID = f"pest_api_{uuid.uuid4().hex[:8]}"
 
 # MQTT Topics
 TOPIC_IMAGE = "pest/image"
 TOPIC_STATUS = "pest/status"
 TOPIC_COMMAND = "pest/command"
-TOPIC_DETECTION = "pest/detection"  # ✅ TAMBAH TOPIC BARU
+TOPIC_DETECTION = "pest/detection"
 
 # ===== KONFIGURASI ROBOFLOW =====
 ROBOFLOW_API_KEY = os.environ.get('ROBOFLOW_API_KEY', 'Frwruit34mrF3dLM4AtX')
 ROBOFLOW_PROJECT = os.environ.get('ROBOFLOW_PROJECT', 'rice-pest-detection-new/1')
 CONFIDENCE_THRESHOLD = int(os.environ.get('CONFIDENCE_THRESHOLD', 40))
 
-# ===== PEST NAMES MAPPING (8 HAMA SAJA) =====
+# ===== PEST NAMES MAPPING =====
 PEST_NAMES = {
     'bacterial_blight': 'Hawar Bakteri (Bacterial Blight)',
     'blast': 'Blas (Blast)',
@@ -58,10 +59,11 @@ PEST_NAMES = {
 
 # ===== GLOBAL VARIABLES =====
 sent_image_ids = set()
-sent_image_ids_lock = threading.Lock()  # ✅ Thread-safe lock
+sent_image_ids_lock = threading.Lock()
 roboflow_model = None
 mqtt_client = None
 mqtt_connected = False
+mqtt_reconnect_timer = None
 esp32_status = {
     'online': False,
     'last_seen': None,
@@ -69,21 +71,20 @@ esp32_status = {
     'total_captures': 0
 }
 
+processed_messages = set()
+processed_messages_lock = threading.Lock()
+
 # ===== DATABASE FUNCTIONS =====
 def get_db_connection():
-    """Koneksi ke database Railway"""
     try:
         conn = mysql.connector.connect(**DB_CONFIG)
         return conn
     except mysql.connector.Error as err:
         print(f"❌ Database error: {err}")
-        print(f"   Config: {DB_CONFIG['host']}:{DB_CONFIG['port']}")
         return None
 
 def init_database():
-    """Initialize database tables jika belum ada"""
     print("\n🗄️  Checking database tables...")
-    
     conn = get_db_connection()
     if not conn:
         print("❌ Cannot connect to database")
@@ -92,7 +93,6 @@ def init_database():
     cursor = conn.cursor()
     
     try:
-        # Create detection_summary table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS detection_summary (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -105,7 +105,6 @@ def init_database():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
         
-        # Create detections table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS detections (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -125,7 +124,6 @@ def init_database():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
         
-        # Create system_status table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS system_status (
                 id INT PRIMARY KEY,
@@ -135,7 +133,6 @@ def init_database():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
         
-        # Create esp32_commands table
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS esp32_commands (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -149,7 +146,6 @@ def init_database():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
         
-        # Insert default system status
         cursor.execute("""
             INSERT IGNORE INTO system_status (id, system_active, total_detections)
             VALUES (1, TRUE, 0)
@@ -168,72 +164,93 @@ def init_database():
 
 # ===== MQTT CALLBACKS =====
 def on_connect(client, userdata, flags, rc):
-    """Callback saat connect ke MQTT broker"""
     global mqtt_connected
     
     if rc == 0:
-        print("✅ Connected to MQTT Broker!")
+        print(f"✅ Connected to MQTT Broker! (Client ID: {MQTT_CLIENT_ID})")
         mqtt_connected = True
         
-        # Subscribe ke topics
         client.subscribe(TOPIC_IMAGE, qos=1)
         client.subscribe(TOPIC_STATUS, qos=1)
-        client.subscribe(TOPIC_DETECTION, qos=1)  # ✅ TAMBAH TOPIC DETECTION
+        client.subscribe(TOPIC_DETECTION, qos=1)
         
         print(f"📡 Subscribed to:")
         print(f"   • {TOPIC_IMAGE}")
         print(f"   • {TOPIC_STATUS}")
-        print(f"   • {TOPIC_DETECTION}")  # ✅ TAMBAH LOG
+        print(f"   • {TOPIC_DETECTION}")
     else:
         print(f"❌ MQTT Connection failed with code {rc}")
         mqtt_connected = False
 
 def on_disconnect(client, userdata, rc):
-    """Callback saat disconnect dari MQTT"""
-    global mqtt_connected
+    global mqtt_connected, mqtt_reconnect_timer
     mqtt_connected = False
     print(f"⚠️  Disconnected from MQTT Broker (rc={rc})")
     
     if rc != 0:
-        print("   Attempting to reconnect...")
+        print("   Attempting to reconnect in 5 seconds...")
+        mqtt_reconnect_timer = threading.Timer(5.0, attempt_mqtt_reconnect)
+        mqtt_reconnect_timer.start()
+
+def attempt_mqtt_reconnect():
+    global mqtt_client, mqtt_connected
+    
+    if not mqtt_connected and mqtt_client:
+        try:
+            print("🔄 Attempting MQTT reconnect...")
+            mqtt_client.reconnect()
+        except Exception as e:
+            print(f"❌ Reconnect failed: {e}")
+            timer = threading.Timer(10.0, attempt_mqtt_reconnect)
+            timer.start()
 
 def on_message(client, userdata, msg):
-    """Callback saat menerima message dari MQTT"""
     topic = msg.topic
     
     try:
-        # Handle binary payload dengan error handling
         try:
             payload = msg.payload.decode('utf-8')
         except UnicodeDecodeError:
             print(f"❌ Cannot decode payload as UTF-8")
             return
         
+        data = json.loads(payload)
+        
+        message_id = f"{topic}_{data.get('timestamp', '')}_{len(payload)}"
+        
+        with processed_messages_lock:
+            if message_id in processed_messages:
+                print(f"⚠️ DUPLICATE MESSAGE - Skipping (ID: {message_id[:20]}...)")
+                return
+            
+            processed_messages.add(message_id)
+            
+            if len(processed_messages) > 1000:
+                old_messages = list(processed_messages)[:500]
+                processed_messages.difference_update(old_messages)
+        
         print(f"\n📨 MQTT Message Received:")
         print(f"   Topic: {topic}")
         print(f"   Size: {len(payload)} bytes")
-        
-        data = json.loads(payload)
+        print(f"   Message ID: {message_id[:30]}...")
         
         if topic == TOPIC_IMAGE:
             handle_image_message(data)
         elif topic == TOPIC_STATUS:
             handle_status_message(data)
-        elif topic == TOPIC_DETECTION:  # ✅ HANDLE DETECTION TOPIC
+        elif topic == TOPIC_DETECTION:
             handle_detection_message(data)
         else:
             print(f"   ⚠️ Unknown topic: {topic}")
             
     except json.JSONDecodeError as e:
         print(f"❌ JSON decode error: {e}")
-        print(f"   Payload preview: {payload[:200] if len(payload) > 200 else payload}")
     except Exception as e:
         print(f"❌ Error handling message: {e}")
         import traceback
         traceback.print_exc()
 
 def handle_image_message(data):
-    """Handle image message dari ESP32"""
     print(f"   Type: IMAGE")
     
     image_base64 = data.get('image', '')
@@ -246,7 +263,6 @@ def handle_image_message(data):
     print(f"   Timestamp: {timestamp}")
     print(f"   Processing with Roboflow...")
     
-    # Deteksi hama
     predictions = detect_pests_roboflow(image_base64)
     
     if predictions is None:
@@ -258,12 +274,9 @@ def handle_image_message(data):
         return
     
     print(f"   🐛 {len(predictions)} pests detected!")
-    
-    # Simpan ke database
     save_detection_to_db(image_base64, predictions)
 
 def handle_status_message(data):
-    """Handle status message dari ESP32"""
     global esp32_status
     
     print(f"   Type: STATUS")
@@ -281,32 +294,9 @@ def handle_status_message(data):
     print(f"   ESP32 Status:")
     print(f"     • Online: {esp32_status['online']}")
     print(f"     • LDR: {esp32_status['ldr_value']}")
-    print(f"     • Light OK: {esp32_status['light_ok']}")
     print(f"     • Captures: {esp32_status['total_captures']}")
 
 def handle_detection_message(data):
-    """
-    ✅ HANDLE TOPIC pest/detection
-    
-    Format yang diterima dari MQTTX untuk testing:
-    {
-        "detection_time": "2026-01-07 10:30:00",
-        "image_base64": "base64_string...",
-        "total_pests_found": 3,
-        "pest_details": [
-            {
-                "pest_type": "wereng",
-                "pest_name_id": "Wereng Daun",
-                "confidence": 0.95,
-                "x": 100,
-                "y": 150,
-                "width": 200,
-                "height": 250
-            }
-        ],
-        "max_confidence": 0.95
-    }
-    """
     print(f"   Type: DETECTION (Direct Save)")
     
     image_base64 = data.get('image_base64', '')
@@ -325,10 +315,8 @@ def handle_detection_message(data):
     
     print(f"   Detection Time: {detection_time}")
     print(f"   Total Pests: {total_pests}")
-    print(f"   Max Confidence: {max_confidence}")
-    print(f"   🐛 Saving {len(pest_details)} pests to database...")
+    print(f"   🐛 Saving to database...")
     
-    # Langsung save ke database tanpa Roboflow detection
     save_detection_to_db_direct(image_base64, pest_details, detection_time, max_confidence)
 
 # ===== MQTT CLIENT SETUP =====
@@ -336,25 +324,15 @@ def init_mqtt():
     global mqtt_client
 
     print("🔌 Initializing MQTT...")
-
-    client_id = f"pest-api-{uuid.uuid4()}"
-    print(f"🆔 MQTT CLIENT ID: {client_id}")
+    print(f"🆔 MQTT CLIENT ID: {MQTT_CLIENT_ID}")
 
     mqtt_client = mqtt.Client(
-        client_id=client_id,
+        client_id=MQTT_CLIENT_ID,
         protocol=mqtt.MQTTv311
     )
 
-    # Username & password HiveMQ
-    mqtt_client.username_pw_set(
-        MQTT_USERNAME,
-        MQTT_PASSWORD
-    )
-
-    # 🔐 WAJIB UNTUK PORT 8883 (HiveMQ Cloud)
-    mqtt_client.tls_set(
-        tls_version=ssl.PROTOCOL_TLS_CLIENT
-    )
+    mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    mqtt_client.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)
     mqtt_client.tls_insecure_set(False)
 
     mqtt_client.on_connect = on_connect
@@ -364,14 +342,17 @@ def init_mqtt():
     mqtt_client.reconnect_delay_set(min_delay=2, max_delay=10)
 
     print(f"🌐 Connecting to MQTT {MQTT_BROKER}:{MQTT_PORT} (TLS)")
-    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-
-    mqtt_client.loop_start()
-    print("✅ MQTT client started")
-
+    
+    try:
+        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+        mqtt_client.loop_start()
+        print("✅ MQTT client started")
+        return True
+    except Exception as e:
+        print(f"❌ MQTT connection error: {e}")
+        return False
 
 def publish_command(command):
-    """Publish command ke ESP32 via MQTT"""
     global mqtt_client, mqtt_connected
     
     if not mqtt_connected:
@@ -384,7 +365,6 @@ def publish_command(command):
         
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
             print(f"✅ Command published to {TOPIC_COMMAND}")
-            print(f"   Payload: {payload}")
             return True
         else:
             print(f"❌ Publish failed with rc={result.rc}")
@@ -396,7 +376,6 @@ def publish_command(command):
 
 # ===== ROBOFLOW =====
 def init_roboflow():
-    """Initialize Roboflow model"""
     global roboflow_model
     
     print("\n🤖 Initializing Roboflow AI...")
@@ -410,23 +389,21 @@ def init_roboflow():
         print("✅ Roboflow model ready!")
         print(f"   Model: {ROBOFLOW_PROJECT}")
         print(f"   Confidence: {CONFIDENCE_THRESHOLD}%")
-        print(f"   Pest Types: {len(PEST_NAMES)}")
         return True
         
     except Exception as e:
         print(f"❌ Roboflow init error: {e}")
+        roboflow_model = None
         return False
 
 def detect_pests_roboflow(image_base64):
-    """Deteksi hama menggunakan Roboflow AI"""
     global roboflow_model
     
     if roboflow_model is None:
         print("❌ Roboflow model not initialized")
-        return None  # Return None untuk indicate error
+        return None
     
     try:
-        # Decode base64 to image
         image_data = base64.b64decode(image_base64)
         nparr = np.frombuffer(image_data, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -435,11 +412,9 @@ def detect_pests_roboflow(image_base64):
             print("❌ Failed to decode image")
             return None
         
-        # Save temporary file
         temp_path = "/tmp/temp_detection.jpg"
         cv2.imwrite(temp_path, img)
         
-        # Run detection
         prediction = roboflow_model.predict(
             temp_path,
             confidence=CONFIDENCE_THRESHOLD
@@ -455,7 +430,6 @@ def detect_pests_roboflow(image_base64):
         return None
 
 def save_detection_to_db(image_base64, predictions):
-    """Simpan hasil deteksi dari Roboflow ke database"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -463,7 +437,6 @@ def save_detection_to_db(image_base64, predictions):
         
         cursor = conn.cursor()
         
-        # Build detections
         detections = []
         max_confidence = 0
         
@@ -471,7 +444,6 @@ def save_detection_to_db(image_base64, predictions):
             pest_id = pred.get('class')
             confidence = pred.get('confidence', 0)
             
-            # Get pest name dari mapping
             pest_name = PEST_NAMES.get(pest_id, pest_id.replace('_', ' ').title())
             
             detections.append({
@@ -487,7 +459,6 @@ def save_detection_to_db(image_base64, predictions):
             if confidence > max_confidence:
                 max_confidence = confidence
         
-        # Insert ke detection_summary
         cursor.execute("""
             INSERT INTO detection_summary 
             (image_base64, total_pests_found, pest_details, max_confidence)
@@ -501,7 +472,6 @@ def save_detection_to_db(image_base64, predictions):
         
         summary_id = cursor.lastrowid
         
-        # Insert detail deteksi
         for det in detections:
             cursor.execute("""
                 INSERT INTO detections 
@@ -520,7 +490,6 @@ def save_detection_to_db(image_base64, predictions):
                 len(detections)
             ))
         
-        # Update system status
         cursor.execute("""
             UPDATE system_status 
             SET total_detections = total_detections + 1,
@@ -543,10 +512,6 @@ def save_detection_to_db(image_base64, predictions):
         return False
 
 def save_detection_to_db_direct(image_base64, pest_details, detection_time=None, max_confidence=None):
-    """
-    ✅ Simpan deteksi langsung ke database (tanpa Roboflow)
-    Untuk data yang sudah dideteksi dari MQTTX atau external source
-    """
     try:
         conn = get_db_connection()
         if not conn:
@@ -554,11 +519,9 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
         
         cursor = conn.cursor()
         
-        # Calculate max confidence jika tidak diberikan
         if max_confidence is None:
             max_confidence = max([float(p.get('confidence', 0)) for p in pest_details], default=0)
         
-        # Insert ke detection_summary
         if detection_time:
             cursor.execute("""
                 INSERT INTO detection_summary 
@@ -585,7 +548,6 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
         
         summary_id = cursor.lastrowid
         
-        # Insert detail deteksi
         for det in pest_details:
             cursor.execute("""
                 INSERT INTO detections 
@@ -604,7 +566,6 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
                 len(pest_details)
             ))
         
-        # Update system status
         cursor.execute("""
             UPDATE system_status 
             SET total_detections = total_detections + 1,
@@ -617,8 +578,6 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
         conn.close()
         
         print(f"✅ Saved to database: ID={summary_id}, Pests={len(pest_details)}")
-        pest_names = [d.get('pest_name_id', 'Unknown') for d in pest_details]
-        print(f"   Detected: {', '.join(pest_names)}")
         return True
         
     except Exception as e:
@@ -627,11 +586,18 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
         traceback.print_exc()
         return False
 
+def cleanup_sent_ids():
+    while True:
+        time.sleep(3600)
+        with sent_image_ids_lock:
+            if len(sent_image_ids) > 100:
+                print(f"🧹 Cleaning up sent_image_ids ({len(sent_image_ids)} items)")
+                sent_image_ids.clear()
+
 # ===== REST API ENDPOINTS =====
 
 @app.route('/api/trigger-capture', methods=['POST'])
 def trigger_capture():
-    """Flutter trigger manual capture via MQTT"""
     try:
         command = {"action": "CAPTURE"}
         success = publish_command(command)
@@ -652,7 +618,6 @@ def trigger_capture():
 
 @app.route('/data', methods=['GET'])
 def get_data():
-    """Flutter ambil data deteksi terbaru"""
     global sent_image_ids, esp32_status
     
     try:
@@ -662,15 +627,13 @@ def get_data():
         
         cursor = conn.cursor(dictionary=True)
         
-        # Get system status
         cursor.execute("SELECT * FROM system_status WHERE id = 1")
         status = cursor.fetchone()
         
         if not status:
             status = {'system_active': True, 'total_detections': 0}
         
-        # Get latest detection
-        with sent_image_ids_lock:  # ✅ Thread-safe access
+        with sent_image_ids_lock:
             if sent_image_ids:
                 placeholders = ','.join(['%s'] * len(sent_image_ids))
                 query = f"""
@@ -691,7 +654,6 @@ def get_data():
         
         latest = cursor.fetchone()
         
-        # Get pest names
         pest_names = []
         if latest:
             cursor.execute("""
@@ -721,7 +683,6 @@ def get_data():
         cursor.close()
         conn.close()
         
-        # Build response
         response = {
             'motion': False,
             'totalDetections': status['total_detections'],
@@ -740,9 +701,8 @@ def get_data():
             }
         }
         
-        # Send new detection if available
         if latest:
-            with sent_image_ids_lock:  # ✅ Thread-safe access
+            with sent_image_ids_lock:
                 if latest['id'] not in sent_image_ids:
                     response['newDetection'] = True
                     response['motion'] = True
@@ -768,7 +728,6 @@ def get_data():
 
 @app.route('/api/history', methods=['GET'])
 def get_history():
-    """Flutter ambil riwayat deteksi"""
     try:
         limit = request.args.get('limit', 50, type=int)
         
@@ -826,7 +785,6 @@ def get_history():
 
 @app.route('/control', methods=['POST'])
 def control():
-    """Flutter control system on/off"""
     try:
         data = request.json
         
@@ -860,7 +818,6 @@ def control():
 
 @app.route('/api/delete/<int:summary_id>', methods=['DELETE'])
 def delete_detection(summary_id):
-    """Flutter hapus deteksi"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -886,7 +843,7 @@ def delete_detection(summary_id):
         cursor.close()
         conn.close()
         
-        with sent_image_ids_lock:  # ✅ Thread-safe access
+        with sent_image_ids_lock:
             sent_image_ids.discard(summary_id)
         
         return jsonify({'success': True}), 200
@@ -911,17 +868,17 @@ def ping():
         'database': 'connected' if db_ok else 'error',
         'timestamp': datetime.now().isoformat(),
         'mqtt_connected': mqtt_connected,
+        'mqtt_client_id': MQTT_CLIENT_ID,
         'roboflow_ready': roboflow_model is not None,
         'esp32_online': esp32_status['online'],
         'pest_types': len(PEST_NAMES)
     }), 200
 
-
 @app.route('/api/mqtt-status', methods=['GET'])
 def mqtt_status():
-    """Get MQTT connection status"""
     return jsonify({
         'connected': mqtt_connected,
+        'client_id': MQTT_CLIENT_ID,
         'broker': MQTT_BROKER,
         'port': MQTT_PORT,
         'esp32_status': {
@@ -935,7 +892,6 @@ def mqtt_status():
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
-    """Get detection statistics"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -943,11 +899,9 @@ def get_stats():
         
         cursor = conn.cursor(dictionary=True)
         
-        # Total detections
         cursor.execute("SELECT COUNT(*) as total FROM detection_summary")
         total = cursor.fetchone()['total']
         
-        # Today's detections
         cursor.execute("""
             SELECT COUNT(*) as today 
             FROM detection_summary 
@@ -955,7 +909,6 @@ def get_stats():
         """)
         today = cursor.fetchone()['today']
         
-        # Top pest
         cursor.execute("""
             SELECT pest_name_id, COUNT(*) as count
             FROM detections
@@ -965,7 +918,6 @@ def get_stats():
         """)
         top_pest = cursor.fetchone()
         
-        # Pest distribution
         cursor.execute("""
             SELECT pest_name_id, COUNT(*) as count
             FROM detections
@@ -997,49 +949,54 @@ print("  🐛 PEST DETECTION API WITH MQTT")
 print("  8 Rice Pest Types Detection System")
 print("="*60)
 
-# Initialize components
 print("\n📦 Initializing components...")
-init_database()
-init_roboflow()
-init_mqtt()
+
+db_ok = init_database()
+roboflow_ok = init_roboflow()
+mqtt_ok = init_mqtt()
+
+cleanup_thread = threading.Thread(target=cleanup_sent_ids, daemon=True)
+cleanup_thread.start()
 
 print("\n" + "="*60)
-print("  ✅ API READY!")
+if db_ok and roboflow_ok and mqtt_ok:
+    print("  ✅ ALL SYSTEMS READY!")
+else:
+    print("  ⚠️ SOME SYSTEMS FAILED TO INITIALIZE")
+    if not db_ok:
+        print("     ❌ Database")
+    if not roboflow_ok:
+        print("     ❌ Roboflow AI")
+    if not mqtt_ok:
+        print("     ❌ MQTT Connection")
 print("="*60)
 
 print(f"\n🐛 Pest Types ({len(PEST_NAMES)}):")
 for i, (key, name) in enumerate(PEST_NAMES.items(), 1):
     print(f"   {i}. {name}")
 
-print(f"\n📡 MQTT Topics:")
-print(f"   Subscribe:")
+print(f"\n📡 MQTT Configuration:")
+print(f"   Broker: {MQTT_BROKER}:{MQTT_PORT}")
+print(f"   Client ID: {MQTT_CLIENT_ID}")
+print(f"   Topics:")
 print(f"     • {TOPIC_IMAGE} (ESP32 → API)")
 print(f"     • {TOPIC_STATUS} (ESP32 → API)")
-print(f"     • {TOPIC_DETECTION} (MQTTX/Test → API)")  # ✅ TAMBAH
-print(f"   Publish:")
+print(f"     • {TOPIC_DETECTION} (Test → API)")
 print(f"     • {TOPIC_COMMAND} (API → ESP32)")
 
 print(f"\n🌐 REST API Endpoints:")
-print(f"   • POST   /api/trigger-capture  - Trigger manual capture")
-print(f"   • GET    /data                 - Get latest detection")
-print(f"   • GET    /api/history          - Get detection history")
-print(f"   • POST   /control              - System on/off")
-print(f"   • DELETE /api/delete/<id>      - Delete detection")
-print(f"   • GET    /ping                 - Health check")
-print(f"   • GET    /api/mqtt-status      - MQTT & ESP32 status")
-print(f"   • GET    /api/stats            - Detection statistics")
+print(f"   • POST   /api/trigger-capture")
+print(f"   • GET    /data")
+print(f"   • GET    /api/history")
+print(f"   • POST   /control")
+print(f"   • DELETE /api/delete/<id>")
+print(f"   • GET    /ping")
+print(f"   • GET    /api/mqtt-status")
+print(f"   • GET    /api/stats")
 print("="*60 + "\n")
 
-print("🚀 Starting application...")
-print("   Mode: Production (Gunicorn)")
-print("   Workers: 2")
-print("   Timeout: 120s")
-print("")
-
 if __name__ == '__main__':
-    # Hanya untuk local testing
     port = int(os.environ.get('PORT', 5000))
     print(f"⚠️  Running in development mode on port {port}")
-    print(f"   For production, use: gunicorn app:app")
-    print("")
+    print(f"   For production, use: gunicorn app:app --workers 1")
     app.run(host='0.0.0.0', port=port, debug=False)
