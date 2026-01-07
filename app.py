@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import mysql.connector
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import base64
 import json
 import cv2
@@ -17,6 +17,11 @@ import time
 
 app = Flask(__name__)
 CORS(app)
+
+# ===== TIMEZONE CONFIGURATION =====
+# Indonesia WIB (GMT+7)
+WIB_OFFSET = timedelta(hours=7)
+WIB_TZ = timezone(WIB_OFFSET)
 
 
 DB_CONFIG = {
@@ -664,49 +669,54 @@ def save_detection_to_db_with_timestamp(image_base64, predictions, timestamp_val
             if confidence > max_confidence:
                 max_confidence = confidence
         
-        # ✅ Convert timestamp if provided
+        # ✅ Convert timestamp if provided (DENGAN TIMEZONE WIB)
         detection_time = None
         if timestamp_value:
             try:
                 if isinstance(timestamp_value, (int, float)):
-                    # Unix timestamp
-                    detection_time = datetime.fromtimestamp(timestamp_value)
+                    # Unix timestamp dari ESP32
+                    # PROBLEM: ESP32 mungkin mengirim dalam UTC, kita perlu convert ke WIB
+                    # Solusi: Tambah 7 jam (WIB offset)
+                    utc_time = datetime.utcfromtimestamp(timestamp_value)
+                    detection_time = utc_time + WIB_OFFSET
+                    print(f"   📅 UTC: {utc_time} -> WIB: {detection_time}")
+                    
                 elif isinstance(timestamp_value, str) and timestamp_value.isdigit():
                     # Unix timestamp as string
-                    detection_time = datetime.fromtimestamp(int(timestamp_value))
+                    utc_time = datetime.utcfromtimestamp(int(timestamp_value))
+                    detection_time = utc_time + WIB_OFFSET
+                    print(f"   📅 UTC (str): {utc_time} -> WIB: {detection_time}")
+                    
                 elif isinstance(timestamp_value, str):
-                    # Already formatted string
+                    # Already formatted string (anggap sudah WIB)
                     try:
                         detection_time = datetime.strptime(timestamp_value, '%Y-%m-%d %H:%M:%S')
+                        print(f"   📅 Parsed datetime string: {timestamp_value}")
                     except ValueError:
                         detection_time = None
-            except (ValueError, OSError):
+                        print(f"   ⚠️ Failed to parse timestamp: {timestamp_value}")
+                        
+            except (ValueError, OSError) as e:
+                print(f"   ⚠️ Timestamp conversion error: {e}")
                 detection_time = None
         
-        # Insert with or without timestamp
-        if detection_time:
-            cursor.execute("""
-                INSERT INTO detection_summary 
-                (detection_time, image_base64, total_pests_found, pest_details, max_confidence)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (
-                detection_time,
-                image_base64,
-                len(detections),
-                json.dumps(detections),
-                float(max_confidence)
-            ))
-        else:
-            cursor.execute("""
-                INSERT INTO detection_summary 
-                (image_base64, total_pests_found, pest_details, max_confidence)
-                VALUES (%s, %s, %s, %s)
-            """, (
-                image_base64,
-                len(detections),
-                json.dumps(detections),
-                float(max_confidence)
-            ))
+        # If no valid timestamp, use current time
+        if not detection_time:
+            detection_time = datetime.now()
+            print(f"   📅 Using current time: {detection_time}")
+        
+        # Insert with timestamp
+        cursor.execute("""
+            INSERT INTO detection_summary 
+            (detection_time, image_base64, total_pests_found, pest_details, max_confidence)
+            VALUES (%s, %s, %s, %s, %s)
+        """, (
+            detection_time,
+            image_base64,
+            len(detections),
+            json.dumps(detections),
+            float(max_confidence)
+        ))
         
         summary_id = cursor.lastrowid
         
@@ -759,34 +769,45 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
         if max_confidence is None:
             max_confidence = max([float(p.get('confidence', 0)) for p in pest_details], default=0)
         
-        # ✅ Convert Unix timestamp to datetime if needed
+        # ✅ Convert Unix timestamp to datetime if needed (DENGAN TIMEZONE WIB)
+        converted_time = None
         if detection_time:
             # Check if it's a Unix timestamp (integer or numeric string)
             try:
                 if isinstance(detection_time, (int, float)):
-                    # Unix timestamp
-                    detection_time = datetime.fromtimestamp(detection_time)
+                    # Unix timestamp dari ESP32 (UTC) - convert ke WIB
+                    utc_time = datetime.utcfromtimestamp(detection_time)
+                    converted_time = utc_time + WIB_OFFSET
+                    print(f"   📅 UTC: {utc_time} -> WIB: {converted_time}")
+                    
                 elif isinstance(detection_time, str) and detection_time.isdigit():
                     # Unix timestamp as string
-                    detection_time = datetime.fromtimestamp(int(detection_time))
+                    utc_time = datetime.utcfromtimestamp(int(detection_time))
+                    converted_time = utc_time + WIB_OFFSET
+                    print(f"   📅 UTC (str): {utc_time} -> WIB: {converted_time}")
+                    
                 elif isinstance(detection_time, str):
-                    # Already formatted string, parse it
+                    # Already formatted string, parse it (anggap sudah WIB)
                     try:
-                        detection_time = datetime.strptime(detection_time, '%Y-%m-%d %H:%M:%S')
+                        converted_time = datetime.strptime(detection_time, '%Y-%m-%d %H:%M:%S')
+                        print(f"   📅 Parsed datetime string: {detection_time}")
                     except ValueError:
                         # If parsing fails, use current time
-                        detection_time = datetime.now()
-            except (ValueError, OSError):
+                        converted_time = datetime.now()
+                        print(f"   ⚠️ Parse failed, using current time")
+                        
+            except (ValueError, OSError) as e:
                 # Invalid timestamp, use current time
-                detection_time = datetime.now()
+                converted_time = datetime.now()
+                print(f"   ⚠️ Timestamp error: {e}, using current time")
         
-        if detection_time:
+        if converted_time:
             cursor.execute("""
                 INSERT INTO detection_summary 
                 (detection_time, image_base64, total_pests_found, pest_details, max_confidence)
                 VALUES (%s, %s, %s, %s, %s)
             """, (
-                detection_time,
+                converted_time,
                 image_base64,
                 len(pest_details),
                 json.dumps(pest_details),
