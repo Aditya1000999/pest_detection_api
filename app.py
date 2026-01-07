@@ -104,6 +104,7 @@ def handle_chunked_image(data):
     total_chunks = data.get('total_chunks')
     chunk_data = data.get('data')
     is_last = data.get('is_last', False)
+    timestamp_str = data.get('timestamp')  # ✅ TAMBAHKAN INI
     
     if not all([session_id, chunk_index is not None, total_chunks, chunk_data]):
         print("⚠️ Invalid chunk data - missing required fields")
@@ -119,7 +120,8 @@ def handle_chunked_image(data):
                 'total_chunks': total_chunks,
                 'received_chunks': 0,
                 'start_time': time.time(),
-                'last_update': time.time()
+                'last_update': time.time(),
+                'timestamp_str': timestamp_str  # ✅ SIMPAN TIMESTAMP
             }
         
         session = chunk_storage[session_id]
@@ -151,12 +153,14 @@ def handle_chunked_image(data):
             
             print(f"   Assembled base64 length: {len(assembled_b64)} chars")
             
-            # Get metadata from last chunk
+            # Get metadata and timestamp
             original_size = data.get('original_size', 0)
             capture_number = data.get('capture_number', 0)
+            timestamp_str = session['timestamp_str']  # ✅ AMBIL TIMESTAMP
             
             print(f"   Original size: {original_size} bytes")
             print(f"   Capture number: {capture_number}")
+            print(f"   Timestamp: {timestamp_str}")  # ✅ LOG TIMESTAMP
             print(f"   Processing with Roboflow...")
             
             # Process the complete image
@@ -174,7 +178,7 @@ def handle_chunked_image(data):
                 return True
             
             print(f"   🐛 {len(predictions)} pests detected!")
-            save_detection_to_db(assembled_b64, predictions)
+            save_detection_to_db(assembled_b64, predictions, timestamp_str)  # ✅ KIRIM TIMESTAMP
             return True
         
         return False  # Not complete yet
@@ -362,7 +366,7 @@ def handle_image_message(data):
     print(f"   Type: IMAGE (Non-chunked)")
     
     image_base64 = data.get('image', '')
-    timestamp = data.get('timestamp', '')
+    timestamp = data.get('timestamp', '')  # ✅ AMBIL TIMESTAMP
     
     if not image_base64:
         print("   ⚠️ No image data")
@@ -382,7 +386,7 @@ def handle_image_message(data):
         return
     
     print(f"   🐛 {len(predictions)} pests detected!")
-    save_detection_to_db(image_base64, predictions)
+    save_detection_to_db(image_base64, predictions, timestamp)  # ✅ KIRIM TIMESTAMP
 
 def handle_status_message(data):
     global esp32_status
@@ -531,7 +535,15 @@ def detect_pests_roboflow(image_base64):
         print(f"❌ Detection error: {e}")
         return None
 
-def save_detection_to_db(image_base64, predictions):
+def save_detection_to_db(image_base64, predictions, timestamp_str=None):
+    """
+    Save detection to database with custom timestamp
+    
+    Args:
+        image_base64: Base64 encoded image
+        predictions: List of pest predictions from Roboflow
+        timestamp_str: Optional timestamp string from client (format: 'YYYY-MM-DD HH:MM:SS')
+    """
     try:
         conn = get_db_connection()
         if not conn:
@@ -561,16 +573,32 @@ def save_detection_to_db(image_base64, predictions):
             if confidence > max_confidence:
                 max_confidence = confidence
         
-        cursor.execute("""
-            INSERT INTO detection_summary 
-            (image_base64, total_pests_found, pest_details, max_confidence)
-            VALUES (%s, %s, %s, %s)
-        """, (
-            image_base64,
-            len(detections),
-            json.dumps(detections),
-            float(max_confidence)
-        ))
+        # ✅ GUNAKAN TIMESTAMP DARI CLIENT JIKA ADA
+        if timestamp_str:
+            cursor.execute("""
+                INSERT INTO detection_summary 
+                (detection_time, image_base64, total_pests_found, pest_details, max_confidence)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (
+                timestamp_str,
+                image_base64,
+                len(detections),
+                json.dumps(detections),
+                float(max_confidence)
+            ))
+            print(f"   Using client timestamp: {timestamp_str}")
+        else:
+            cursor.execute("""
+                INSERT INTO detection_summary 
+                (image_base64, total_pests_found, pest_details, max_confidence)
+                VALUES (%s, %s, %s, %s)
+            """, (
+                image_base64,
+                len(detections),
+                json.dumps(detections),
+                float(max_confidence)
+            ))
+            print(f"   Using server timestamp (NOW)")
         
         summary_id = cursor.lastrowid
         
@@ -608,6 +636,8 @@ def save_detection_to_db(image_base64, predictions):
         
     except Exception as e:
         print(f"❌ DB error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def save_detection_to_db_direct(image_base64, pest_details, detection_time=None, max_confidence=None):
