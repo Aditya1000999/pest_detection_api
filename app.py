@@ -394,7 +394,25 @@ def handle_image_message(data):
         print("   ⚠️ No image data")
         return
     
-    print(f"   Timestamp: {timestamp}")
+    print(f"   Timestamp received: {timestamp}")
+    
+    # ✅ Convert timestamp if Unix timestamp
+    detection_time = None
+    if timestamp:
+        try:
+            if isinstance(timestamp, (int, float)):
+                # Unix timestamp - convert ke WIB
+                utc_time = datetime.utcfromtimestamp(timestamp)
+                detection_time = utc_time + WIB_OFFSET
+                print(f"   📅 Converted: UTC {utc_time} -> WIB {detection_time}")
+            elif isinstance(timestamp, str) and timestamp.isdigit():
+                # Unix timestamp as string
+                utc_time = datetime.utcfromtimestamp(int(timestamp))
+                detection_time = utc_time + WIB_OFFSET
+                print(f"   📅 Converted: UTC {utc_time} -> WIB {detection_time}")
+        except:
+            pass
+    
     print(f"   Processing with Roboflow...")
     
     predictions = detect_pests_roboflow(image_base64)
@@ -408,7 +426,12 @@ def handle_image_message(data):
         return
     
     print(f"   🐛 {len(predictions)} pests detected!")
-    save_detection_to_db(image_base64, predictions)
+    
+    # ✅ Save dengan timestamp yang sudah dikonversi
+    if detection_time:
+        save_detection_to_db_with_timestamp(image_base64, predictions, detection_time)
+    else:
+        save_detection_to_db(image_base64, predictions)
 
 def handle_status_message(data):
     global esp32_status
@@ -674,18 +697,21 @@ def save_detection_to_db_with_timestamp(image_base64, predictions, timestamp_val
         if timestamp_value:
             try:
                 if isinstance(timestamp_value, (int, float)):
-                    # Unix timestamp - ESP32 sudah dalam WIB
-                    # Kita convert langsung tanpa adjustment
-                    detection_time = datetime.fromtimestamp(timestamp_value)
-                    print(f"   📅 Converted Unix timestamp: {timestamp_value} -> {detection_time}")
+                    # Unix timestamp dari ESP32
+                    # PROBLEM: ESP32 mungkin mengirim dalam UTC, kita perlu convert ke WIB
+                    # Solusi: Tambah 7 jam (WIB offset)
+                    utc_time = datetime.utcfromtimestamp(timestamp_value)
+                    detection_time = utc_time + WIB_OFFSET
+                    print(f"   📅 UTC: {utc_time} -> WIB: {detection_time}")
                     
                 elif isinstance(timestamp_value, str) and timestamp_value.isdigit():
                     # Unix timestamp as string
-                    detection_time = datetime.fromtimestamp(int(timestamp_value))
-                    print(f"   📅 Converted Unix timestamp (str): {timestamp_value} -> {detection_time}")
+                    utc_time = datetime.utcfromtimestamp(int(timestamp_value))
+                    detection_time = utc_time + WIB_OFFSET
+                    print(f"   📅 UTC (str): {utc_time} -> WIB: {detection_time}")
                     
                 elif isinstance(timestamp_value, str):
-                    # Already formatted string (format: YYYY-MM-DD HH:MM:SS)
+                    # Already formatted string (anggap sudah WIB)
                     try:
                         detection_time = datetime.strptime(timestamp_value, '%Y-%m-%d %H:%M:%S')
                         print(f"   📅 Parsed datetime string: {timestamp_value}")
@@ -772,17 +798,19 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
             # Check if it's a Unix timestamp (integer or numeric string)
             try:
                 if isinstance(detection_time, (int, float)):
-                    # Unix timestamp - ESP32 sudah dalam WIB
-                    converted_time = datetime.fromtimestamp(detection_time)
-                    print(f"   📅 Converted Unix timestamp: {detection_time} -> {converted_time}")
+                    # Unix timestamp dari ESP32 (UTC) - convert ke WIB
+                    utc_time = datetime.utcfromtimestamp(detection_time)
+                    converted_time = utc_time + WIB_OFFSET
+                    print(f"   📅 UTC: {utc_time} -> WIB: {converted_time}")
                     
                 elif isinstance(detection_time, str) and detection_time.isdigit():
                     # Unix timestamp as string
-                    converted_time = datetime.fromtimestamp(int(detection_time))
-                    print(f"   📅 Converted Unix timestamp (str): {detection_time} -> {converted_time}")
+                    utc_time = datetime.utcfromtimestamp(int(detection_time))
+                    converted_time = utc_time + WIB_OFFSET
+                    print(f"   📅 UTC (str): {utc_time} -> WIB: {converted_time}")
                     
                 elif isinstance(detection_time, str):
-                    # Already formatted string, parse it
+                    # Already formatted string, parse it (anggap sudah WIB)
                     try:
                         converted_time = datetime.strptime(detection_time, '%Y-%m-%d %H:%M:%S')
                         print(f"   📅 Parsed datetime string: {detection_time}")
