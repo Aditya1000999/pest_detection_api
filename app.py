@@ -78,6 +78,15 @@ processed_messages_lock = threading.Lock()
 chunk_storage = {}
 chunk_storage_lock = threading.Lock()
 
+# ===== TIMESTAMP HELPER =====
+def format_detection_time(dt):
+    """Format detection_time dari database ke string"""
+    if dt is None:
+        return None
+    if isinstance(dt, str):
+        return dt
+    return dt.strftime('%Y-%m-%d %H:%M:%S')
+
 # ===== CHUNKED MESSAGE HANDLER =====
 def cleanup_old_sessions():
     """Cleanup sessions older than 5 minutes"""
@@ -104,7 +113,6 @@ def handle_chunked_image(data):
     total_chunks = data.get('total_chunks')
     chunk_data = data.get('data')
     is_last = data.get('is_last', False)
-    timestamp_str = data.get('timestamp')  # ✅ TAMBAHKAN INI
     
     if not all([session_id, chunk_index is not None, total_chunks, chunk_data]):
         print("⚠️ Invalid chunk data - missing required fields")
@@ -120,8 +128,7 @@ def handle_chunked_image(data):
                 'total_chunks': total_chunks,
                 'received_chunks': 0,
                 'start_time': time.time(),
-                'last_update': time.time(),
-                'timestamp_str': timestamp_str  # ✅ SIMPAN TIMESTAMP
+                'last_update': time.time()
             }
         
         session = chunk_storage[session_id]
@@ -153,14 +160,12 @@ def handle_chunked_image(data):
             
             print(f"   Assembled base64 length: {len(assembled_b64)} chars")
             
-            # Get metadata and timestamp
+            # Get metadata from last chunk
             original_size = data.get('original_size', 0)
             capture_number = data.get('capture_number', 0)
-            timestamp_str = session['timestamp_str']  # ✅ AMBIL TIMESTAMP
             
             print(f"   Original size: {original_size} bytes")
             print(f"   Capture number: {capture_number}")
-            print(f"   Timestamp: {timestamp_str}")  # ✅ LOG TIMESTAMP
             print(f"   Processing with Roboflow...")
             
             # Process the complete image
@@ -178,7 +183,7 @@ def handle_chunked_image(data):
                 return True
             
             print(f"   🐛 {len(predictions)} pests detected!")
-            save_detection_to_db(assembled_b64, predictions, timestamp_str)  # ✅ KIRIM TIMESTAMP
+            save_detection_to_db(assembled_b64, predictions)
             return True
         
         return False  # Not complete yet
@@ -366,7 +371,7 @@ def handle_image_message(data):
     print(f"   Type: IMAGE (Non-chunked)")
     
     image_base64 = data.get('image', '')
-    timestamp = data.get('timestamp', '')  # ✅ AMBIL TIMESTAMP
+    timestamp = data.get('timestamp', '')
     
     if not image_base64:
         print("   ⚠️ No image data")
@@ -386,7 +391,7 @@ def handle_image_message(data):
         return
     
     print(f"   🐛 {len(predictions)} pests detected!")
-    save_detection_to_db(image_base64, predictions, timestamp)  # ✅ KIRIM TIMESTAMP
+    save_detection_to_db(image_base64, predictions)
 
 def handle_status_message(data):
     global esp32_status
@@ -535,15 +540,7 @@ def detect_pests_roboflow(image_base64):
         print(f"❌ Detection error: {e}")
         return None
 
-def save_detection_to_db(image_base64, predictions, timestamp_str=None):
-    """
-    Save detection to database with custom timestamp
-    
-    Args:
-        image_base64: Base64 encoded image
-        predictions: List of pest predictions from Roboflow
-        timestamp_str: Optional timestamp string from client (format: 'YYYY-MM-DD HH:MM:SS')
-    """
+def save_detection_to_db(image_base64, predictions):
     try:
         conn = get_db_connection()
         if not conn:
@@ -573,32 +570,16 @@ def save_detection_to_db(image_base64, predictions, timestamp_str=None):
             if confidence > max_confidence:
                 max_confidence = confidence
         
-        # ✅ GUNAKAN TIMESTAMP DARI CLIENT JIKA ADA
-        if timestamp_str:
-            cursor.execute("""
-                INSERT INTO detection_summary 
-                (detection_time, image_base64, total_pests_found, pest_details, max_confidence)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (
-                timestamp_str,
-                image_base64,
-                len(detections),
-                json.dumps(detections),
-                float(max_confidence)
-            ))
-            print(f"   Using client timestamp: {timestamp_str}")
-        else:
-            cursor.execute("""
-                INSERT INTO detection_summary 
-                (image_base64, total_pests_found, pest_details, max_confidence)
-                VALUES (%s, %s, %s, %s)
-            """, (
-                image_base64,
-                len(detections),
-                json.dumps(detections),
-                float(max_confidence)
-            ))
-            print(f"   Using server timestamp (NOW)")
+        cursor.execute("""
+            INSERT INTO detection_summary 
+            (image_base64, total_pests_found, pest_details, max_confidence)
+            VALUES (%s, %s, %s, %s)
+        """, (
+            image_base64,
+            len(detections),
+            json.dumps(detections),
+            float(max_confidence)
+        ))
         
         summary_id = cursor.lastrowid
         
@@ -636,8 +617,6 @@ def save_detection_to_db(image_base64, predictions, timestamp_str=None):
         
     except Exception as e:
         print(f"❌ DB error: {e}")
-        import traceback
-        traceback.print_exc()
         return False
 
 def save_detection_to_db_direct(image_base64, pest_details, detection_time=None, max_confidence=None):
@@ -813,7 +792,7 @@ def get_data():
         response = {
             'motion': False,
             'totalDetections': status['total_detections'],
-            'lastDetection': last_record['detection_time'].strftime('%Y-%m-%d %H:%M:%S') if last_record else '-',
+            'lastDetection': format_detection_time(last_record['detection_time']) if last_record else '-',
             'systemActive': bool(status['system_active']),
             'newDetection': False,
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -835,6 +814,8 @@ def get_data():
                     response['motion'] = True
                     response['image'] = latest['image_base64']
                     response['id'] = latest['id']
+                    # ✅ WAKTU PENGAMBILAN GAMBAR
+                    response['detectionTime'] = format_detection_time(latest['detection_time'])
                     response['confidence'] = int(float(latest['max_confidence']) * 100) if latest['max_confidence'] else 85
                     response['pestNames'] = pest_names
                     response['pestName'] = ', '.join(pest_names) if pest_names else 'Unknown'
@@ -850,6 +831,7 @@ def get_data():
     except Exception as e:
         print(f"❌ Error /data: {e}")
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/history', methods=['GET'])
 def get_history():
@@ -891,7 +873,8 @@ def get_history():
                 except:
                     pest_names = ['Unknown']
             
-            item['timestamp'] = item['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
+            # ✅ WAKTU PENGAMBILAN GAMBAR
+            item['timestamp'] = format_detection_time(item['timestamp'])
             item['confidence'] = int(float(item['confidence']) * 100) if item['confidence'] else 85
             item['motionDetected'] = True
             item['pestNames'] = pest_names
@@ -905,6 +888,7 @@ def get_history():
     except Exception as e:
         print(f"❌ Error /api/history: {e}")
         return jsonify({'error': str(e)}), 500
+
 
 @app.route('/control', methods=['POST'])
 def control():
@@ -938,6 +922,7 @@ def control():
     except Exception as e:
         print(f"❌ Error /control: {e}")
         return jsonify({'success': False}), 500
+
 
 @app.route('/api/delete/<int:summary_id>', methods=['DELETE'])
 def delete_detection(summary_id):
@@ -975,6 +960,7 @@ def delete_detection(summary_id):
         print(f"❌ Error /api/delete: {e}")
         return jsonify({'success': False}), 500
 
+
 @app.route('/ping', methods=['GET'])
 def ping():
     db_ok = False
@@ -997,6 +983,7 @@ def ping():
         'chunked_sessions': len(chunk_storage)
     }), 200
 
+
 @app.route('/api/mqtt-status', methods=['GET'])
 def mqtt_status():
     return jsonify({
@@ -1013,6 +1000,7 @@ def mqtt_status():
             'last_seen': esp32_status['last_seen'].isoformat() if esp32_status['last_seen'] else None
         }
     }), 200
+
 
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
@@ -1050,6 +1038,15 @@ def get_stats():
         """)
         pest_distribution = cursor.fetchall()
         
+        # ✅ Get last detection time
+        cursor.execute("""
+            SELECT detection_time 
+            FROM detection_summary 
+            ORDER BY detection_time DESC 
+            LIMIT 1
+        """)
+        last_detection = cursor.fetchone()
+        
         cursor.close()
         conn.close()
         
@@ -1061,12 +1058,82 @@ def get_stats():
             'pest_distribution': pest_distribution,
             'mqtt_connected': mqtt_connected,
             'esp32_online': esp32_status['online'],
-            'chunked_sessions': len(chunk_storage)
+            'chunked_sessions': len(chunk_storage),
+            # ✅ WAKTU DETECTION TERAKHIR
+            'lastDetectionTime': format_detection_time(last_detection['detection_time']) if last_detection else None
         }), 200
         
     except Exception as e:
         print(f"❌ Error /api/stats: {e}")
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/detection/<int:summary_id>', methods=['GET'])
+def get_detection_by_id(summary_id):
+    """Get detection detail dengan timestamp pengambilan gambar"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Database error'}), 500
+        
+        cursor = conn.cursor(dictionary=True)
+        
+        cursor.execute("""
+            SELECT id, detection_time, image_base64, max_confidence,
+                   total_pests_found, pest_details
+            FROM detection_summary
+            WHERE id = %s
+        """, (summary_id,))
+        
+        detection = cursor.fetchone()
+        
+        if not detection:
+            cursor.close()
+            conn.close()
+            return jsonify({'error': 'Detection not found'}), 404
+        
+        cursor.execute("""
+            SELECT pest_name_id, confidence, location_x, location_y, 
+                   width, height
+            FROM detections 
+            WHERE summary_id = %s
+            ORDER BY confidence DESC
+        """, (summary_id,))
+        
+        detections = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        # ✅ WAKTU PENGAMBILAN GAMBAR
+        response = {
+            'id': detection['id'],
+            'detectionTime': format_detection_time(detection['detection_time']),
+            'image': detection['image_base64'],
+            'totalPests': detection['total_pests_found'],
+            'maxConfidence': float(detection['max_confidence']) if detection['max_confidence'] else 0,
+            'pestDetails': json.loads(detection['pest_details']) if detection['pest_details'] else [],
+            'detections': []
+        }
+        
+        for det in detections:
+            response['detections'].append({
+                'pestName': det['pest_name_id'],
+                'confidence': float(det['confidence']),
+                'location': {
+                    'x': det['location_x'],
+                    'y': det['location_y'],
+                    'width': det['width'],
+                    'height': det['height']
+                }
+            })
+        
+        return jsonify(response), 200
+        
+    except Exception as e:
+        print(f"❌ Error /api/detection/{summary_id}: {e}")
+        return jsonify({'error': str(e)}), 500
+
 
 # ===== INITIALIZE ON STARTUP =====
 print("\n" + "="*60)
@@ -1116,6 +1183,7 @@ print(f"   GET    /data")
 print(f"   GET    /api/history")
 print(f"   POST   /control")
 print(f"   DELETE /api/delete/<id>")
+print(f"   GET    /api/detection/<id>")
 print(f"   GET    /ping")
 print(f"   GET    /api/mqtt-status")
 print(f"   GET    /api/stats")
