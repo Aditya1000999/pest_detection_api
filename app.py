@@ -74,6 +74,111 @@ esp32_status = {
 processed_messages = set()
 processed_messages_lock = threading.Lock()
 
+# ===== CHUNKED MESSAGE STORAGE =====
+chunk_storage = {}
+chunk_storage_lock = threading.Lock()
+
+# ===== CHUNKED MESSAGE HANDLER =====
+def cleanup_old_sessions():
+    """Cleanup sessions older than 5 minutes"""
+    while True:
+        time.sleep(300)  # Every 5 minutes
+        current_time = time.time()
+        
+        with chunk_storage_lock:
+            sessions_to_delete = []
+            for session_id, data in chunk_storage.items():
+                if current_time - data['last_update'] > 300:  # 5 minutes
+                    sessions_to_delete.append(session_id)
+            
+            for session_id in sessions_to_delete:
+                print(f"🧹 Cleaning up old session: {session_id}")
+                del chunk_storage[session_id]
+
+def handle_chunked_image(data):
+    """
+    ✅ Handle chunked image transmission from ESP32
+    """
+    session_id = data.get('session_id')
+    chunk_index = data.get('chunk_index')
+    total_chunks = data.get('total_chunks')
+    chunk_data = data.get('data')
+    is_last = data.get('is_last', False)
+    
+    if not all([session_id, chunk_index is not None, total_chunks, chunk_data]):
+        print("⚠️ Invalid chunk data - missing required fields")
+        return False
+    
+    with chunk_storage_lock:
+        # Initialize session if new
+        if session_id not in chunk_storage:
+            print(f"\n📦 NEW CHUNKED SESSION: {session_id}")
+            print(f"   Total chunks expected: {total_chunks}")
+            chunk_storage[session_id] = {
+                'chunks': {},
+                'total_chunks': total_chunks,
+                'received_chunks': 0,
+                'start_time': time.time(),
+                'last_update': time.time()
+            }
+        
+        session = chunk_storage[session_id]
+        
+        # Store chunk
+        if chunk_index not in session['chunks']:
+            session['chunks'][chunk_index] = chunk_data
+            session['received_chunks'] += 1
+            session['last_update'] = time.time()
+            
+            print(f"   ✓ Chunk {chunk_index + 1}/{total_chunks} received " +
+                  f"({session['received_chunks']}/{total_chunks})")
+        else:
+            print(f"   ⚠️ Duplicate chunk {chunk_index} - skipping")
+        
+        # Check if all chunks received
+        if session['received_chunks'] == total_chunks:
+            print(f"\n✅ All chunks received for session {session_id}")
+            print(f"   Assembling image...")
+            
+            # Assemble chunks in order
+            assembled_b64 = ''
+            for i in range(total_chunks):
+                if i not in session['chunks']:
+                    print(f"   ❌ Missing chunk {i} - cannot assemble")
+                    del chunk_storage[session_id]
+                    return False
+                assembled_b64 += session['chunks'][i]
+            
+            print(f"   Assembled base64 length: {len(assembled_b64)} chars")
+            
+            # Get metadata from last chunk
+            original_size = data.get('original_size', 0)
+            capture_number = data.get('capture_number', 0)
+            
+            print(f"   Original size: {original_size} bytes")
+            print(f"   Capture number: {capture_number}")
+            print(f"   Processing with Roboflow...")
+            
+            # Process the complete image
+            predictions = detect_pests_roboflow(assembled_b64)
+            
+            # Clean up session
+            del chunk_storage[session_id]
+            
+            if predictions is None:
+                print("   ❌ Detection error")
+                return False
+            
+            if len(predictions) == 0:
+                print("   ✅ No pests detected - not saving")
+                return True
+            
+            print(f"   🐛 {len(predictions)} pests detected!")
+            save_detection_to_db(assembled_b64, predictions)
+            return True
+        
+        return False  # Not complete yet
+
 # ===== DATABASE FUNCTIONS =====
 def get_db_connection():
     try:
@@ -216,23 +321,19 @@ def on_message(client, userdata, msg):
         
         data = json.loads(payload)
         
-        message_id = f"{topic}_{data.get('timestamp', '')}_{len(payload)}"
+        message_id = f"{topic}_{data.get('timestamp', '')}_{data.get('session_id', '')}_{data.get('chunk_index', '')}"
         
         with processed_messages_lock:
             if message_id in processed_messages:
-                print(f"⚠️ DUPLICATE MESSAGE - Skipping (ID: {message_id[:20]}...)")
-                return
+                return  # Skip duplicate
             
             processed_messages.add(message_id)
             
-            if len(processed_messages) > 1000:
-                old_messages = list(processed_messages)[:500]
+            if len(processed_messages) > 2000:
+                old_messages = list(processed_messages)[:1000]
                 processed_messages.difference_update(old_messages)
         
-        print(f"\n📨 MQTT Message Received:")
-        print(f"   Topic: {topic}")
-        print(f"   Size: {len(payload)} bytes")
-        print(f"   Message ID: {message_id[:30]}...")
+        print(f"\n📨 MQTT Message: {topic}")
         
         if topic == TOPIC_IMAGE:
             handle_image_message(data)
@@ -240,8 +341,6 @@ def on_message(client, userdata, msg):
             handle_status_message(data)
         elif topic == TOPIC_DETECTION:
             handle_detection_message(data)
-        else:
-            print(f"   ⚠️ Unknown topic: {topic}")
             
     except json.JSONDecodeError as e:
         print(f"❌ JSON decode error: {e}")
@@ -251,7 +350,16 @@ def on_message(client, userdata, msg):
         traceback.print_exc()
 
 def handle_image_message(data):
-    print(f"   Type: IMAGE")
+    """Handle both chunked and non-chunked image messages"""
+    
+    # ✅ Check if it's a chunked message
+    if 'chunk_index' in data and 'total_chunks' in data:
+        print(f"   Type: CHUNKED IMAGE")
+        handle_chunked_image(data)
+        return
+    
+    # ✅ Non-chunked (from Python GUI)
+    print(f"   Type: IMAGE (Non-chunked)")
     
     image_base64 = data.get('image', '')
     timestamp = data.get('timestamp', '')
@@ -266,7 +374,7 @@ def handle_image_message(data):
     predictions = detect_pests_roboflow(image_base64)
     
     if predictions is None:
-        print("   ❌ Detection error - skipping save")
+        print("   ❌ Detection error")
         return
     
     if len(predictions) == 0:
@@ -291,10 +399,7 @@ def handle_status_message(data):
         'free_heap': data.get('free_heap', 0)
     }
     
-    print(f"   ESP32 Status:")
-    print(f"     • Online: {esp32_status['online']}")
-    print(f"     • LDR: {esp32_status['ldr_value']}")
-    print(f"     • Captures: {esp32_status['total_captures']}")
+    print(f"   ESP32 Online: {esp32_status['online']}")
 
 def handle_detection_message(data):
     print(f"   Type: DETECTION (Direct Save)")
@@ -310,10 +415,9 @@ def handle_detection_message(data):
         return
     
     if not pest_details or len(pest_details) == 0:
-        print("   ⚠️ No pest details provided")
+        print("   ⚠️ No pest details")
         return
     
-    print(f"   Detection Time: {detection_time}")
     print(f"   Total Pests: {total_pests}")
     print(f"   🐛 Saving to database...")
     
@@ -324,7 +428,7 @@ def init_mqtt():
     global mqtt_client
 
     print("🔌 Initializing MQTT...")
-    print(f"🆔 MQTT CLIENT ID: {MQTT_CLIENT_ID}")
+    print(f"🆔 CLIENT ID: {MQTT_CLIENT_ID}")
 
     mqtt_client = mqtt.Client(
         client_id=MQTT_CLIENT_ID,
@@ -341,7 +445,7 @@ def init_mqtt():
 
     mqtt_client.reconnect_delay_set(min_delay=2, max_delay=10)
 
-    print(f"🌐 Connecting to MQTT {MQTT_BROKER}:{MQTT_PORT} (TLS)")
+    print(f"🌐 Connecting to {MQTT_BROKER}:{MQTT_PORT}")
     
     try:
         mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
@@ -349,14 +453,14 @@ def init_mqtt():
         print("✅ MQTT client started")
         return True
     except Exception as e:
-        print(f"❌ MQTT connection error: {e}")
+        print(f"❌ MQTT error: {e}")
         return False
 
 def publish_command(command):
     global mqtt_client, mqtt_connected
     
     if not mqtt_connected:
-        print("❌ MQTT not connected, cannot send command")
+        print("❌ MQTT not connected")
         return False
     
     try:
@@ -364,14 +468,14 @@ def publish_command(command):
         result = mqtt_client.publish(TOPIC_COMMAND, payload, qos=1)
         
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
-            print(f"✅ Command published to {TOPIC_COMMAND}")
+            print(f"✅ Command published")
             return True
         else:
-            print(f"❌ Publish failed with rc={result.rc}")
+            print(f"❌ Publish failed: {result.rc}")
             return False
             
     except Exception as e:
-        print(f"❌ Error publishing command: {e}")
+        print(f"❌ Error: {e}")
         return False
 
 # ===== ROBOFLOW =====
@@ -386,13 +490,13 @@ def init_roboflow():
         project = rf.workspace().project(project_name)
         roboflow_model = project.version(int(version)).model
         
-        print("✅ Roboflow model ready!")
+        print("✅ Roboflow ready!")
         print(f"   Model: {ROBOFLOW_PROJECT}")
         print(f"   Confidence: {CONFIDENCE_THRESHOLD}%")
         return True
         
     except Exception as e:
-        print(f"❌ Roboflow init error: {e}")
+        print(f"❌ Roboflow error: {e}")
         roboflow_model = None
         return False
 
@@ -400,7 +504,7 @@ def detect_pests_roboflow(image_base64):
     global roboflow_model
     
     if roboflow_model is None:
-        print("❌ Roboflow model not initialized")
+        print("❌ Roboflow not initialized")
         return None
     
     try:
@@ -425,8 +529,6 @@ def detect_pests_roboflow(image_base64):
         
     except Exception as e:
         print(f"❌ Detection error: {e}")
-        import traceback
-        traceback.print_exc()
         return None
 
 def save_detection_to_db(image_base64, predictions):
@@ -501,14 +603,11 @@ def save_detection_to_db(image_base64, predictions):
         cursor.close()
         conn.close()
         
-        print(f"✅ Saved to database: ID={summary_id}, Pests={len(detections)}")
-        print(f"   Detected: {', '.join([d['pest_name_id'] for d in detections])}")
+        print(f"✅ Saved: ID={summary_id}, Pests={len(detections)}")
         return True
         
     except Exception as e:
-        print(f"❌ Database save error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ DB error: {e}")
         return False
 
 def save_detection_to_db_direct(image_base64, pest_details, detection_time=None, max_confidence=None):
@@ -557,7 +656,7 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
             """, (
                 summary_id,
                 det.get('pest_type', 'unknown'),
-                det.get('pest_name_id', 'Unknown Pest'),
+                det.get('pest_name_id', 'Unknown'),
                 float(det.get('confidence', 0)),
                 int(det.get('x', 0)),
                 int(det.get('y', 0)),
@@ -577,13 +676,11 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
         cursor.close()
         conn.close()
         
-        print(f"✅ Saved to database: ID={summary_id}, Pests={len(pest_details)}")
+        print(f"✅ Saved: ID={summary_id}")
         return True
         
     except Exception as e:
-        print(f"❌ Database save error: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ DB error: {e}")
         return False
 
 def cleanup_sent_ids():
@@ -591,7 +688,7 @@ def cleanup_sent_ids():
         time.sleep(3600)
         with sent_image_ids_lock:
             if len(sent_image_ids) > 100:
-                print(f"🧹 Cleaning up sent_image_ids ({len(sent_image_ids)} items)")
+                print(f"🧹 Cleanup sent_image_ids")
                 sent_image_ids.clear()
 
 # ===== REST API ENDPOINTS =====
@@ -605,7 +702,7 @@ def trigger_capture():
         if success:
             return jsonify({
                 'success': True,
-                'message': 'Capture command sent to ESP32 via MQTT'
+                'message': 'Capture command sent'
             }), 200
         else:
             return jsonify({
@@ -672,7 +769,7 @@ def get_data():
                     pest_details = json.loads(latest.get('pest_details', '[]'))
                     pest_names = list(set([d.get('pest_name_id') for d in pest_details if d.get('pest_name_id')]))
                 except:
-                    pest_names = ['Unknown Pest']
+                    pest_names = ['Unknown']
         
         cursor.execute("""
             SELECT detection_time FROM detection_summary 
@@ -691,7 +788,7 @@ def get_data():
             'newDetection': False,
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'confidence': 85,
-            'pestName': 'Unknown Pest',
+            'pestName': 'Unknown',
             'pestNames': [],
             'esp32Status': {
                 'online': esp32_status['online'],
@@ -710,7 +807,7 @@ def get_data():
                     response['id'] = latest['id']
                     response['confidence'] = int(float(latest['max_confidence']) * 100) if latest['max_confidence'] else 85
                     response['pestNames'] = pest_names
-                    response['pestName'] = ', '.join(pest_names) if pest_names else 'Unknown Pest'
+                    response['pestName'] = ', '.join(pest_names) if pest_names else 'Unknown'
                     
                     sent_image_ids.add(latest['id'])
                     
@@ -722,8 +819,6 @@ def get_data():
         
     except Exception as e:
         print(f"❌ Error /data: {e}")
-        import traceback
-        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/history', methods=['GET'])
@@ -764,13 +859,13 @@ def get_history():
                     pest_details = json.loads(item.get('pest_details', '[]'))
                     pest_names = list(set([d.get('pest_name_id') for d in pest_details if d.get('pest_name_id')]))
                 except:
-                    pest_names = ['Unknown Pest']
+                    pest_names = ['Unknown']
             
             item['timestamp'] = item['timestamp'].strftime('%Y-%m-%d %H:%M:%S')
             item['confidence'] = int(float(item['confidence']) * 100) if item['confidence'] else 85
             item['motionDetected'] = True
             item['pestNames'] = pest_names
-            item['pestName'] = ', '.join(pest_names) if pest_names else 'Unknown Pest'
+            item['pestName'] = ', '.join(pest_names) if pest_names else 'Unknown'
         
         cursor.close()
         conn.close()
@@ -779,8 +874,6 @@ def get_history():
         
     except Exception as e:
         print(f"❌ Error /api/history: {e}")
-        import traceback
-        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/control', methods=['POST'])
@@ -871,7 +964,7 @@ def ping():
         'mqtt_client_id': MQTT_CLIENT_ID,
         'roboflow_ready': roboflow_model is not None,
         'esp32_online': esp32_status['online'],
-        'pest_types': len(PEST_NAMES)
+        'chunked_sessions': len(chunk_storage)
     }), 200
 
 @app.route('/api/mqtt-status', methods=['GET'])
@@ -881,6 +974,7 @@ def mqtt_status():
         'client_id': MQTT_CLIENT_ID,
         'broker': MQTT_BROKER,
         'port': MQTT_PORT,
+        'chunked_sessions_active': len(chunk_storage),
         'esp32_status': {
             'online': esp32_status['online'],
             'ldr_value': esp32_status['ldr_value'],
@@ -936,7 +1030,8 @@ def get_stats():
             'most_detected_count': top_pest['count'] if top_pest else 0,
             'pest_distribution': pest_distribution,
             'mqtt_connected': mqtt_connected,
-            'esp32_online': esp32_status['online']
+            'esp32_online': esp32_status['online'],
+            'chunked_sessions': len(chunk_storage)
         }), 200
         
     except Exception as e:
@@ -945,58 +1040,58 @@ def get_stats():
 
 # ===== INITIALIZE ON STARTUP =====
 print("\n" + "="*60)
-print("  🐛 PEST DETECTION API WITH MQTT")
-print("  8 Rice Pest Types Detection System")
+print("  🐛 PEST DETECTION API - CHUNKED MODE")
+print("  Supports ESP32 Chunked + Python GUI Non-Chunked")
 print("="*60)
 
-print("\n📦 Initializing components...")
+print("\n📦 Initializing...")
 
 db_ok = init_database()
 roboflow_ok = init_roboflow()
 mqtt_ok = init_mqtt()
 
+# Start cleanup threads
 cleanup_thread = threading.Thread(target=cleanup_sent_ids, daemon=True)
 cleanup_thread.start()
+
+session_cleanup_thread = threading.Thread(target=cleanup_old_sessions, daemon=True)
+session_cleanup_thread.start()
 
 print("\n" + "="*60)
 if db_ok and roboflow_ok and mqtt_ok:
     print("  ✅ ALL SYSTEMS READY!")
 else:
-    print("  ⚠️ SOME SYSTEMS FAILED TO INITIALIZE")
+    print("  ⚠️ SOME SYSTEMS FAILED")
     if not db_ok:
         print("     ❌ Database")
     if not roboflow_ok:
-        print("     ❌ Roboflow AI")
+        print("     ❌ Roboflow")
     if not mqtt_ok:
-        print("     ❌ MQTT Connection")
+        print("     ❌ MQTT")
 print("="*60)
 
 print(f"\n🐛 Pest Types ({len(PEST_NAMES)}):")
 for i, (key, name) in enumerate(PEST_NAMES.items(), 1):
     print(f"   {i}. {name}")
 
-print(f"\n📡 MQTT Configuration:")
+print(f"\n📡 MQTT Config:")
 print(f"   Broker: {MQTT_BROKER}:{MQTT_PORT}")
-print(f"   Client ID: {MQTT_CLIENT_ID}")
-print(f"   Topics:")
-print(f"     • {TOPIC_IMAGE} (ESP32 → API)")
-print(f"     • {TOPIC_STATUS} (ESP32 → API)")
-print(f"     • {TOPIC_DETECTION} (Test → API)")
-print(f"     • {TOPIC_COMMAND} (API → ESP32)")
+print(f"   Client: {MQTT_CLIENT_ID}")
+print(f"   Mode: Chunked + Non-Chunked")
+print(f"   Topics: {TOPIC_IMAGE}, {TOPIC_STATUS}, {TOPIC_DETECTION}")
 
-print(f"\n🌐 REST API Endpoints:")
-print(f"   • POST   /api/trigger-capture")
-print(f"   • GET    /data")
-print(f"   • GET    /api/history")
-print(f"   • POST   /control")
-print(f"   • DELETE /api/delete/<id>")
-print(f"   • GET    /ping")
-print(f"   • GET    /api/mqtt-status")
-print(f"   • GET    /api/stats")
+print(f"\n🌐 API Endpoints:")
+print(f"   POST   /api/trigger-capture")
+print(f"   GET    /data")
+print(f"   GET    /api/history")
+print(f"   POST   /control")
+print(f"   DELETE /api/delete/<id>")
+print(f"   GET    /ping")
+print(f"   GET    /api/mqtt-status")
+print(f"   GET    /api/stats")
 print("="*60 + "\n")
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    print(f"⚠️  Running in development mode on port {port}")
-    print(f"   For production, use: gunicorn app:app --workers 1")
+    print(f"🚀 Starting on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
