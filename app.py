@@ -12,6 +12,7 @@ import threading
 import os
 import uuid
 import ssl
+import time
 
 
 app = Flask(__name__)
@@ -37,7 +38,7 @@ MQTT_CLIENT_ID = "pest_detection_api"
 TOPIC_IMAGE = "pest/image"
 TOPIC_STATUS = "pest/status"
 TOPIC_COMMAND = "pest/command"
-TOPIC_DETECTION = "pest/detection"  # ✅ TAMBAH TOPIC BARU
+TOPIC_DETECTION = "pest/detection"
 
 # ===== KONFIGURASI ROBOFLOW =====
 ROBOFLOW_API_KEY = os.environ.get('ROBOFLOW_API_KEY', 'Frwruit34mrF3dLM4AtX')
@@ -58,7 +59,7 @@ PEST_NAMES = {
 
 # ===== GLOBAL VARIABLES =====
 sent_image_ids = set()
-sent_image_ids_lock = threading.Lock()  # ✅ Thread-safe lock
+sent_image_ids_lock = threading.Lock()
 roboflow_model = None
 mqtt_client = None
 mqtt_connected = False
@@ -178,12 +179,12 @@ def on_connect(client, userdata, flags, rc):
         # Subscribe ke topics
         client.subscribe(TOPIC_IMAGE, qos=1)
         client.subscribe(TOPIC_STATUS, qos=1)
-        client.subscribe(TOPIC_DETECTION, qos=1)  # ✅ TAMBAH TOPIC DETECTION
+        client.subscribe(TOPIC_DETECTION, qos=1)
         
         print(f"📡 Subscribed to:")
         print(f"   • {TOPIC_IMAGE}")
         print(f"   • {TOPIC_STATUS}")
-        print(f"   • {TOPIC_DETECTION}")  # ✅ TAMBAH LOG
+        print(f"   • {TOPIC_DETECTION}")
     else:
         print(f"❌ MQTT Connection failed with code {rc}")
         mqtt_connected = False
@@ -219,7 +220,7 @@ def on_message(client, userdata, msg):
             handle_image_message(data)
         elif topic == TOPIC_STATUS:
             handle_status_message(data)
-        elif topic == TOPIC_DETECTION:  # ✅ HANDLE DETECTION TOPIC
+        elif topic == TOPIC_DETECTION:
             handle_detection_message(data)
         else:
             print(f"   ⚠️ Unknown topic: {topic}")
@@ -285,28 +286,7 @@ def handle_status_message(data):
     print(f"     • Captures: {esp32_status['total_captures']}")
 
 def handle_detection_message(data):
-    """
-    ✅ HANDLE TOPIC pest/detection
-    
-    Format yang diterima dari MQTTX untuk testing:
-    {
-        "detection_time": "2026-01-07 10:30:00",
-        "image_base64": "base64_string...",
-        "total_pests_found": 3,
-        "pest_details": [
-            {
-                "pest_type": "wereng",
-                "pest_name_id": "Wereng Daun",
-                "confidence": 0.95,
-                "x": 100,
-                "y": 150,
-                "width": 200,
-                "height": 250
-            }
-        ],
-        "max_confidence": 0.95
-    }
-    """
+    """Handle TOPIC pest/detection - Direct Save"""
     print(f"   Type: DETECTION (Direct Save)")
     
     image_base64 = data.get('image_base64', '')
@@ -345,16 +325,8 @@ def init_mqtt():
         protocol=mqtt.MQTTv311
     )
 
-    # Username & password HiveMQ
-    mqtt_client.username_pw_set(
-        MQTT_USERNAME,
-        MQTT_PASSWORD
-    )
-
-    # 🔐 WAJIB UNTUK PORT 8883 (HiveMQ Cloud)
-    mqtt_client.tls_set(
-        tls_version=ssl.PROTOCOL_TLS_CLIENT
-    )
+    mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+    mqtt_client.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)
     mqtt_client.tls_insecure_set(False)
 
     mqtt_client.on_connect = on_connect
@@ -418,35 +390,134 @@ def init_roboflow():
         return False
 
 def detect_pests_roboflow(image_base64):
-    """Deteksi hama menggunakan Roboflow AI"""
+    """Deteksi hama menggunakan Roboflow AI dengan error handling lengkap"""
     global roboflow_model
     
     if roboflow_model is None:
         print("❌ Roboflow model not initialized")
-        return None  # Return None untuk indicate error
+        return None
     
     try:
         # Decode base64 to image
-        image_data = base64.b64decode(image_base64)
+        try:
+            image_data = base64.b64decode(image_base64)
+        except Exception as e:
+            print(f"❌ Base64 decode error: {e}")
+            return None
+        
+        # Validate image data
+        if len(image_data) < 100:
+            print(f"❌ Image data too small: {len(image_data)} bytes")
+            return None
+        
+        # Convert to numpy array
         nparr = np.frombuffer(image_data, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
         
         if img is None:
-            print("❌ Failed to decode image")
+            print("❌ Failed to decode image from bytes")
             return None
         
-        # Save temporary file
-        temp_path = "/tmp/temp_detection.jpg"
-        cv2.imwrite(temp_path, img)
+        # Validate image dimensions
+        height, width = img.shape[:2]
+        if height < 50 or width < 50:
+            print(f"❌ Image too small: {width}x{height}")
+            return None
         
-        # Run detection
-        prediction = roboflow_model.predict(
-            temp_path,
-            confidence=CONFIDENCE_THRESHOLD
-        ).json()
+        print(f"✅ Image decoded: {width}x{height}, {len(image_data)} bytes")
         
-        predictions = prediction.get('predictions', [])
-        return predictions
+        # Save temporary file dengan error handling
+        temp_path = f"/tmp/temp_detection_{int(time.time())}.jpg"
+        
+        try:
+            # Encode dengan quality tinggi untuk memastikan tidak corrupt
+            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 95]
+            ret, buffer = cv2.imencode('.jpg', img, encode_param)
+            
+            if not ret:
+                print("❌ Failed to encode image to JPEG")
+                return None
+            
+            # Write to file dengan flush
+            with open(temp_path, 'wb') as f:
+                f.write(buffer.tobytes())
+                f.flush()
+                os.fsync(f.fileno())  # Ensure data is written to disk
+            
+            # Verify file exists and has content
+            if not os.path.exists(temp_path):
+                print(f"❌ Temp file not created: {temp_path}")
+                return None
+            
+            file_size = os.path.getsize(temp_path)
+            if file_size < 100:
+                print(f"❌ Temp file too small: {file_size} bytes")
+                os.remove(temp_path)
+                return None
+            
+            print(f"✅ Temp file saved: {temp_path} ({file_size} bytes)")
+            
+            # Verify image can be opened
+            try:
+                test_img = cv2.imread(temp_path)
+                if test_img is None:
+                    print(f"❌ Cannot read back temp file")
+                    os.remove(temp_path)
+                    return None
+            except Exception as e:
+                print(f"❌ Error verifying temp file: {e}")
+                os.remove(temp_path)
+                return None
+            
+            # Run detection with retry
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    print(f"🤖 Running Roboflow detection (attempt {attempt + 1}/{max_retries})...")
+                    
+                    prediction = roboflow_model.predict(
+                        temp_path,
+                        confidence=CONFIDENCE_THRESHOLD
+                    ).json()
+                    
+                    predictions = prediction.get('predictions', [])
+                    print(f"✅ Detection complete: {len(predictions)} pests found")
+                    
+                    # Cleanup
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
+                    
+                    return predictions
+                    
+                except OSError as e:
+                    if "truncated" in str(e).lower():
+                        print(f"⚠️ Image truncated error on attempt {attempt + 1}")
+                        if attempt < max_retries - 1:
+                            print("   Retrying...")
+                            time.sleep(0.5)
+                            continue
+                    raise
+                except Exception as e:
+                    print(f"❌ Roboflow prediction error (attempt {attempt + 1}): {e}")
+                    if attempt < max_retries - 1:
+                        print("   Retrying...")
+                        time.sleep(0.5)
+                        continue
+                    raise
+            
+            # If all retries failed
+            print(f"❌ All {max_retries} detection attempts failed")
+            return None
+            
+        finally:
+            # Cleanup temp file
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception as e:
+                print(f"⚠️ Warning: Could not remove temp file: {e}")
         
     except Exception as e:
         print(f"❌ Detection error: {e}")
@@ -543,10 +614,7 @@ def save_detection_to_db(image_base64, predictions):
         return False
 
 def save_detection_to_db_direct(image_base64, pest_details, detection_time=None, max_confidence=None):
-    """
-    ✅ Simpan deteksi langsung ke database (tanpa Roboflow)
-    Untuk data yang sudah dideteksi dari MQTTX atau external source
-    """
+    """Simpan deteksi langsung ke database (tanpa Roboflow)"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -670,7 +738,7 @@ def get_data():
             status = {'system_active': True, 'total_detections': 0}
         
         # Get latest detection
-        with sent_image_ids_lock:  # ✅ Thread-safe access
+        with sent_image_ids_lock:
             if sent_image_ids:
                 placeholders = ','.join(['%s'] * len(sent_image_ids))
                 query = f"""
@@ -742,7 +810,7 @@ def get_data():
         
         # Send new detection if available
         if latest:
-            with sent_image_ids_lock:  # ✅ Thread-safe access
+            with sent_image_ids_lock:
                 if latest['id'] not in sent_image_ids:
                     response['newDetection'] = True
                     response['motion'] = True
@@ -886,7 +954,7 @@ def delete_detection(summary_id):
         cursor.close()
         conn.close()
         
-        with sent_image_ids_lock:  # ✅ Thread-safe access
+        with sent_image_ids_lock:
             sent_image_ids.discard(summary_id)
         
         return jsonify({'success': True}), 200
@@ -915,7 +983,6 @@ def ping():
         'esp32_online': esp32_status['online'],
         'pest_types': len(PEST_NAMES)
     }), 200
-
 
 @app.route('/api/mqtt-status', methods=['GET'])
 def mqtt_status():
@@ -1015,7 +1082,7 @@ print(f"\n📡 MQTT Topics:")
 print(f"   Subscribe:")
 print(f"     • {TOPIC_IMAGE} (ESP32 → API)")
 print(f"     • {TOPIC_STATUS} (ESP32 → API)")
-print(f"     • {TOPIC_DETECTION} (MQTTX/Test → API)")  # ✅ TAMBAH
+print(f"     • {TOPIC_DETECTION} (MQTTX/Test → API)")
 print(f"   Publish:")
 print(f"     • {TOPIC_COMMAND} (API → ESP32)")
 
@@ -1037,7 +1104,6 @@ print("   Timeout: 120s")
 print("")
 
 if __name__ == '__main__':
-    # Hanya untuk local testing
     port = int(os.environ.get('PORT', 5000))
     print(f"⚠️  Running in development mode on port {port}")
     print(f"   For production, use: gunicorn app:app")
