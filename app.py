@@ -37,7 +37,7 @@ MQTT_CLIENT_ID = "pest_detection_api"
 TOPIC_IMAGE = "pest/image"
 TOPIC_STATUS = "pest/status"
 TOPIC_COMMAND = "pest/command"
-TOPIC_DETECTION = "pest/detection"
+TOPIC_DETECTION = "pest/detection"  # ✅ TAMBAH TOPIC BARU
 
 # ===== KONFIGURASI ROBOFLOW =====
 ROBOFLOW_API_KEY = os.environ.get('ROBOFLOW_API_KEY', 'Frwruit34mrF3dLM4AtX')
@@ -58,15 +58,10 @@ PEST_NAMES = {
 
 # ===== GLOBAL VARIABLES =====
 sent_image_ids = set()
-sent_image_ids_lock = threading.Lock()
+sent_image_ids_lock = threading.Lock()  # ✅ Thread-safe lock
 roboflow_model = None
 mqtt_client = None
 mqtt_connected = False
-
-# ✅ CHUNKED IMAGE BUFFER
-image_chunks_buffer = {}  # {capture_number: {chunk_index: data}}
-image_buffer_lock = threading.Lock()
-
 esp32_status = {
     'online': False,
     'last_seen': None,
@@ -183,12 +178,12 @@ def on_connect(client, userdata, flags, rc):
         # Subscribe ke topics
         client.subscribe(TOPIC_IMAGE, qos=1)
         client.subscribe(TOPIC_STATUS, qos=1)
-        client.subscribe(TOPIC_DETECTION, qos=1)
+        client.subscribe(TOPIC_DETECTION, qos=1)  # ✅ TAMBAH TOPIC DETECTION
         
         print(f"📡 Subscribed to:")
         print(f"   • {TOPIC_IMAGE}")
         print(f"   • {TOPIC_STATUS}")
-        print(f"   • {TOPIC_DETECTION}")
+        print(f"   • {TOPIC_DETECTION}")  # ✅ TAMBAH LOG
     else:
         print(f"❌ MQTT Connection failed with code {rc}")
         mqtt_connected = False
@@ -207,6 +202,7 @@ def on_message(client, userdata, msg):
     topic = msg.topic
     
     try:
+        # Handle binary payload dengan error handling
         try:
             payload = msg.payload.decode('utf-8')
         except UnicodeDecodeError:
@@ -223,7 +219,7 @@ def on_message(client, userdata, msg):
             handle_image_message(data)
         elif topic == TOPIC_STATUS:
             handle_status_message(data)
-        elif topic == TOPIC_DETECTION:
+        elif topic == TOPIC_DETECTION:  # ✅ HANDLE DETECTION TOPIC
             handle_detection_message(data)
         else:
             print(f"   ⚠️ Unknown topic: {topic}")
@@ -237,94 +233,34 @@ def on_message(client, userdata, msg):
         traceback.print_exc()
 
 def handle_image_message(data):
-    """✅ Handle image message chunks dari GUI Camera"""
-    global image_chunks_buffer
-    
+    """Handle image message dari ESP32"""
     print(f"   Type: IMAGE")
     
-    # ✅ CHECK APAKAH INI CHUNKED MESSAGE
-    if 'chunk' in data and 'total_chunks' in data:
-        chunk_idx = data.get('chunk')
-        total_chunks = data.get('total_chunks')
-        chunk_data = data.get('data', '')
-        capture_number = data.get('capture_number', 0)
-        is_complete = data.get('complete', False)
-        
-        print(f"   📦 Chunk {chunk_idx + 1}/{total_chunks} | Capture #{capture_number}")
-        
-        with image_buffer_lock:
-            # Initialize buffer untuk capture ini
-            if capture_number not in image_chunks_buffer:
-                image_chunks_buffer[capture_number] = {}
-            
-            # Simpan chunk
-            image_chunks_buffer[capture_number][chunk_idx] = chunk_data
-            
-            # Cek apakah semua chunks sudah lengkap
-            if is_complete or len(image_chunks_buffer[capture_number]) == total_chunks:
-                print(f"   ✅ All chunks received, reconstructing image...")
-                
-                # Reconstruct image dari chunks
-                try:
-                    sorted_chunks = [image_chunks_buffer[capture_number][i] 
-                                    for i in range(total_chunks)]
-                    full_base64 = ''.join(sorted_chunks)
-                    
-                    # Clean buffer
-                    del image_chunks_buffer[capture_number]
-                    
-                    # Proses deteksi
-                    print(f"   Image reconstructed: {len(full_base64)} chars")
-                    print(f"   Processing with Roboflow...")
-                    
-                    predictions = detect_pests_roboflow(full_base64)
-                    
-                    if predictions is None:
-                        print("   ❌ Detection error - skipping save")
-                        return
-                    
-                    if len(predictions) == 0:
-                        print("   ✅ No pests detected - not saving")
-                        return
-                    
-                    print(f"   🐛 {len(predictions)} pests detected!")
-                    save_detection_to_db(full_base64, predictions)
-                    
-                except Exception as e:
-                    print(f"   ❌ Error reconstructing image: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    if capture_number in image_chunks_buffer:
-                        del image_chunks_buffer[capture_number]
-            else:
-                print(f"   ⏳ Waiting for more chunks... ({len(image_chunks_buffer[capture_number])}/{total_chunks})")
+    image_base64 = data.get('image', '')
+    timestamp = data.get('timestamp', '')
     
-    # ✅ HANDLE FORMAT NON-CHUNKED (backward compatibility)
-    else:
-        image_base64 = data.get('image', '')
-        timestamp = data.get('timestamp', '')
-        
-        if not image_base64:
-            print("   ⚠️ No image data")
-            return
-        
-        print(f"   📸 Non-chunked image received")
-        print(f"   Timestamp: {timestamp}")
-        print(f"   Image size: {len(image_base64)} chars")
-        print(f"   Processing with Roboflow...")
-        
-        predictions = detect_pests_roboflow(image_base64)
-        
-        if predictions is None:
-            print("   ❌ Detection error - skipping save")
-            return
-        
-        if len(predictions) == 0:
-            print("   ✅ No pests detected - not saving")
-            return
-        
-        print(f"   🐛 {len(predictions)} pests detected!")
-        save_detection_to_db(image_base64, predictions)
+    if not image_base64:
+        print("   ⚠️ No image data")
+        return
+    
+    print(f"   Timestamp: {timestamp}")
+    print(f"   Processing with Roboflow...")
+    
+    # Deteksi hama
+    predictions = detect_pests_roboflow(image_base64)
+    
+    if predictions is None:
+        print("   ❌ Detection error - skipping save")
+        return
+    
+    if len(predictions) == 0:
+        print("   ✅ No pests detected - not saving")
+        return
+    
+    print(f"   🐛 {len(predictions)} pests detected!")
+    
+    # Simpan ke database
+    save_detection_to_db(image_base64, predictions)
 
 def handle_status_message(data):
     """Handle status message dari ESP32"""
@@ -349,7 +285,28 @@ def handle_status_message(data):
     print(f"     • Captures: {esp32_status['total_captures']}")
 
 def handle_detection_message(data):
-    """Handle TOPIC pest/detection (Direct Save)"""
+    """
+    ✅ HANDLE TOPIC pest/detection
+    
+    Format yang diterima dari MQTTX untuk testing:
+    {
+        "detection_time": "2026-01-07 10:30:00",
+        "image_base64": "base64_string...",
+        "total_pests_found": 3,
+        "pest_details": [
+            {
+                "pest_type": "wereng",
+                "pest_name_id": "Wereng Daun",
+                "confidence": 0.95,
+                "x": 100,
+                "y": 150,
+                "width": 200,
+                "height": 250
+            }
+        ],
+        "max_confidence": 0.95
+    }
+    """
     print(f"   Type: DETECTION (Direct Save)")
     
     image_base64 = data.get('image_base64', '')
@@ -371,6 +328,7 @@ def handle_detection_message(data):
     print(f"   Max Confidence: {max_confidence}")
     print(f"   🐛 Saving {len(pest_details)} pests to database...")
     
+    # Langsung save ke database tanpa Roboflow detection
     save_detection_to_db_direct(image_base64, pest_details, detection_time, max_confidence)
 
 # ===== MQTT CLIENT SETUP =====
@@ -387,11 +345,13 @@ def init_mqtt():
         protocol=mqtt.MQTTv311
     )
 
+    # Username & password HiveMQ
     mqtt_client.username_pw_set(
         MQTT_USERNAME,
         MQTT_PASSWORD
     )
 
+    # 🔐 WAJIB UNTUK PORT 8883 (HiveMQ Cloud)
     mqtt_client.tls_set(
         tls_version=ssl.PROTOCOL_TLS_CLIENT
     )
@@ -463,7 +423,7 @@ def detect_pests_roboflow(image_base64):
     
     if roboflow_model is None:
         print("❌ Roboflow model not initialized")
-        return None
+        return None  # Return None untuk indicate error
     
     try:
         # Decode base64 to image
@@ -511,6 +471,7 @@ def save_detection_to_db(image_base64, predictions):
             pest_id = pred.get('class')
             confidence = pred.get('confidence', 0)
             
+            # Get pest name dari mapping
             pest_name = PEST_NAMES.get(pest_id, pest_id.replace('_', ' ').title())
             
             detections.append({
@@ -582,7 +543,10 @@ def save_detection_to_db(image_base64, predictions):
         return False
 
 def save_detection_to_db_direct(image_base64, pest_details, detection_time=None, max_confidence=None):
-    """Simpan deteksi langsung ke database (tanpa Roboflow)"""
+    """
+    ✅ Simpan deteksi langsung ke database (tanpa Roboflow)
+    Untuk data yang sudah dideteksi dari MQTTX atau external source
+    """
     try:
         conn = get_db_connection()
         if not conn:
@@ -590,6 +554,7 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
         
         cursor = conn.cursor()
         
+        # Calculate max confidence jika tidak diberikan
         if max_confidence is None:
             max_confidence = max([float(p.get('confidence', 0)) for p in pest_details], default=0)
         
@@ -697,13 +662,15 @@ def get_data():
         
         cursor = conn.cursor(dictionary=True)
         
+        # Get system status
         cursor.execute("SELECT * FROM system_status WHERE id = 1")
         status = cursor.fetchone()
         
         if not status:
             status = {'system_active': True, 'total_detections': 0}
         
-        with sent_image_ids_lock:
+        # Get latest detection
+        with sent_image_ids_lock:  # ✅ Thread-safe access
             if sent_image_ids:
                 placeholders = ','.join(['%s'] * len(sent_image_ids))
                 query = f"""
@@ -724,6 +691,7 @@ def get_data():
         
         latest = cursor.fetchone()
         
+        # Get pest names
         pest_names = []
         if latest:
             cursor.execute("""
@@ -753,6 +721,7 @@ def get_data():
         cursor.close()
         conn.close()
         
+        # Build response
         response = {
             'motion': False,
             'totalDetections': status['total_detections'],
@@ -771,8 +740,9 @@ def get_data():
             }
         }
         
+        # Send new detection if available
         if latest:
-            with sent_image_ids_lock:
+            with sent_image_ids_lock:  # ✅ Thread-safe access
                 if latest['id'] not in sent_image_ids:
                     response['newDetection'] = True
                     response['motion'] = True
@@ -916,7 +886,7 @@ def delete_detection(summary_id):
         cursor.close()
         conn.close()
         
-        with sent_image_ids_lock:
+        with sent_image_ids_lock:  # ✅ Thread-safe access
             sent_image_ids.discard(summary_id)
         
         return jsonify({'success': True}), 200
@@ -973,9 +943,11 @@ def get_stats():
         
         cursor = conn.cursor(dictionary=True)
         
+        # Total detections
         cursor.execute("SELECT COUNT(*) as total FROM detection_summary")
         total = cursor.fetchone()['total']
         
+        # Today's detections
         cursor.execute("""
             SELECT COUNT(*) as today 
             FROM detection_summary 
@@ -983,6 +955,7 @@ def get_stats():
         """)
         today = cursor.fetchone()['today']
         
+        # Top pest
         cursor.execute("""
             SELECT pest_name_id, COUNT(*) as count
             FROM detections
@@ -992,6 +965,7 @@ def get_stats():
         """)
         top_pest = cursor.fetchone()
         
+        # Pest distribution
         cursor.execute("""
             SELECT pest_name_id, COUNT(*) as count
             FROM detections
@@ -1023,6 +997,7 @@ print("  🐛 PEST DETECTION API WITH MQTT")
 print("  8 Rice Pest Types Detection System")
 print("="*60)
 
+# Initialize components
 print("\n📦 Initializing components...")
 init_database()
 init_roboflow()
@@ -1038,9 +1013,9 @@ for i, (key, name) in enumerate(PEST_NAMES.items(), 1):
 
 print(f"\n📡 MQTT Topics:")
 print(f"   Subscribe:")
-print(f"     • {TOPIC_IMAGE} (ESP32/GUI → API)")
+print(f"     • {TOPIC_IMAGE} (ESP32 → API)")
 print(f"     • {TOPIC_STATUS} (ESP32 → API)")
-print(f"     • {TOPIC_DETECTION} (MQTTX/Test → API)")
+print(f"     • {TOPIC_DETECTION} (MQTTX/Test → API)")  # ✅ TAMBAH
 print(f"   Publish:")
 print(f"     • {TOPIC_COMMAND} (API → ESP32)")
 
@@ -1053,13 +1028,6 @@ print(f"   • DELETE /api/delete/<id>      - Delete detection")
 print(f"   • GET    /ping                 - Health check")
 print(f"   • GET    /api/mqtt-status      - MQTT & ESP32 status")
 print(f"   • GET    /api/stats            - Detection statistics")
-
-print("\n✨ Features:")
-print("   • ✅ Chunked image reconstruction (no truncation)")
-print("   • ✅ Thread-safe buffer management")
-print("   • ✅ Backward compatible with non-chunked messages")
-print("   • ✅ Automatic chunk cleanup")
-
 print("="*60 + "\n")
 
 print("🚀 Starting application...")
@@ -1069,6 +1037,7 @@ print("   Timeout: 120s")
 print("")
 
 if __name__ == '__main__':
+    # Hanya untuk local testing
     port = int(os.environ.get('PORT', 5000))
     print(f"⚠️  Running in development mode on port {port}")
     print(f"   For production, use: gunicorn app:app")
