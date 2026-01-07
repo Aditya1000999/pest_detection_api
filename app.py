@@ -164,8 +164,18 @@ def handle_chunked_image(data):
             original_size = data.get('original_size', 0)
             capture_number = data.get('capture_number', 0)
             
+            # ✅ Get timestamp from ESP32
+            timestamp_unix = data.get('timestamp', None)
+            timestamp_str = data.get('timestamp_str', None)
+            
             print(f"   Original size: {original_size} bytes")
             print(f"   Capture number: {capture_number}")
+            
+            if timestamp_unix:
+                print(f"   Timestamp (Unix): {timestamp_unix}")
+            if timestamp_str:
+                print(f"   Timestamp (String): {timestamp_str}")
+            
             print(f"   Processing with Roboflow...")
             
             # Process the complete image
@@ -183,7 +193,9 @@ def handle_chunked_image(data):
                 return True
             
             print(f"   🐛 {len(predictions)} pests detected!")
-            save_detection_to_db(assembled_b64, predictions)
+            
+            # ✅ Save with timestamp from ESP32
+            save_detection_to_db_with_timestamp(assembled_b64, predictions, timestamp_unix or timestamp_str)
             return True
         
         return False  # Not complete yet
@@ -541,6 +553,7 @@ def detect_pests_roboflow(image_base64):
         return None
 
 def save_detection_to_db(image_base64, predictions):
+    """Save detection without explicit timestamp (uses database default)"""
     try:
         conn = get_db_connection()
         if not conn:
@@ -619,6 +632,122 @@ def save_detection_to_db(image_base64, predictions):
         print(f"❌ DB error: {e}")
         return False
 
+
+def save_detection_to_db_with_timestamp(image_base64, predictions, timestamp_value=None):
+    """Save detection WITH timestamp from ESP32"""
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        
+        cursor = conn.cursor()
+        
+        detections = []
+        max_confidence = 0
+        
+        for pred in predictions:
+            pest_id = pred.get('class')
+            confidence = pred.get('confidence', 0)
+            
+            pest_name = PEST_NAMES.get(pest_id, pest_id.replace('_', ' ').title())
+            
+            detections.append({
+                'pest_type': str(pest_id),
+                'pest_name_id': str(pest_name),
+                'confidence': float(confidence),
+                'x': int(pred.get('x', 0)),
+                'y': int(pred.get('y', 0)),
+                'width': int(pred.get('width', 0)),
+                'height': int(pred.get('height', 0))
+            })
+            
+            if confidence > max_confidence:
+                max_confidence = confidence
+        
+        # ✅ Convert timestamp if provided
+        detection_time = None
+        if timestamp_value:
+            try:
+                if isinstance(timestamp_value, (int, float)):
+                    # Unix timestamp
+                    detection_time = datetime.fromtimestamp(timestamp_value)
+                elif isinstance(timestamp_value, str) and timestamp_value.isdigit():
+                    # Unix timestamp as string
+                    detection_time = datetime.fromtimestamp(int(timestamp_value))
+                elif isinstance(timestamp_value, str):
+                    # Already formatted string
+                    try:
+                        detection_time = datetime.strptime(timestamp_value, '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        detection_time = None
+            except (ValueError, OSError):
+                detection_time = None
+        
+        # Insert with or without timestamp
+        if detection_time:
+            cursor.execute("""
+                INSERT INTO detection_summary 
+                (detection_time, image_base64, total_pests_found, pest_details, max_confidence)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (
+                detection_time,
+                image_base64,
+                len(detections),
+                json.dumps(detections),
+                float(max_confidence)
+            ))
+        else:
+            cursor.execute("""
+                INSERT INTO detection_summary 
+                (image_base64, total_pests_found, pest_details, max_confidence)
+                VALUES (%s, %s, %s, %s)
+            """, (
+                image_base64,
+                len(detections),
+                json.dumps(detections),
+                float(max_confidence)
+            ))
+        
+        summary_id = cursor.lastrowid
+        
+        for det in detections:
+            cursor.execute("""
+                INSERT INTO detections 
+                (summary_id, pest_type, pest_name_id, confidence, 
+                 location_x, location_y, width, height, total_pests)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                summary_id,
+                det['pest_type'],
+                det['pest_name_id'],
+                det['confidence'],
+                det['x'],
+                det['y'],
+                det['width'],
+                det['height'],
+                len(detections)
+            ))
+        
+        cursor.execute("""
+            UPDATE system_status 
+            SET total_detections = total_detections + 1,
+                last_update = NOW()
+            WHERE id = 1
+        """)
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print(f"✅ Saved: ID={summary_id}, Pests={len(detections)}, Time={detection_time}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ DB error: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
 def save_detection_to_db_direct(image_base64, pest_details, detection_time=None, max_confidence=None):
     try:
         conn = get_db_connection()
@@ -629,6 +758,27 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
         
         if max_confidence is None:
             max_confidence = max([float(p.get('confidence', 0)) for p in pest_details], default=0)
+        
+        # ✅ Convert Unix timestamp to datetime if needed
+        if detection_time:
+            # Check if it's a Unix timestamp (integer or numeric string)
+            try:
+                if isinstance(detection_time, (int, float)):
+                    # Unix timestamp
+                    detection_time = datetime.fromtimestamp(detection_time)
+                elif isinstance(detection_time, str) and detection_time.isdigit():
+                    # Unix timestamp as string
+                    detection_time = datetime.fromtimestamp(int(detection_time))
+                elif isinstance(detection_time, str):
+                    # Already formatted string, parse it
+                    try:
+                        detection_time = datetime.strptime(detection_time, '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        # If parsing fails, use current time
+                        detection_time = datetime.now()
+            except (ValueError, OSError):
+                # Invalid timestamp, use current time
+                detection_time = datetime.now()
         
         if detection_time:
             cursor.execute("""
