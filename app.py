@@ -72,7 +72,7 @@ PEST_NAMES = {
     'rat': 'Tikus (Rat)'
 }
 
-ESP32_TIMEOUT_SECONDS = 30 # ESP32 dianggap offline setelah 30 detik
+ESP32_TIMEOUT_SECONDS = 5 # ESP32 dianggap offline setelah 5 detik
 
 # ===== GLOBAL VARIABLES =====
 sent_image_ids = set()
