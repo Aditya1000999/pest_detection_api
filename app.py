@@ -72,6 +72,8 @@ PEST_NAMES = {
     'rat': 'Tikus (Rat)'
 }
 
+ESP32_TIMEOUT_SECONDS = 30 # ESP32 dianggap offline setelah 30 detik
+
 # ===== GLOBAL VARIABLES =====
 sent_image_ids = set()
 sent_image_ids_lock = threading.Lock()
@@ -124,6 +126,47 @@ def cleanup_old_sessions():
             for session_id in sessions_to_delete:
                 print(f"🧹 Cleaning up old session: {session_id}")
                 del chunk_storage[session_id]
+
+def check_esp32_timeout():
+    """
+    ✅ Background thread untuk mengecek ESP32 timeout
+    Mengupdate status esp32_status['online'] secara otomatis
+    """
+    global esp32_status
+    
+    print("🔍 ESP32 timeout monitor started")
+    
+    while True:
+        time.sleep(5)  # Check every 5 seconds
+        
+        if esp32_status['last_seen']:
+            time_diff = (get_current_wib_time() - esp32_status['last_seen']).total_seconds()
+            
+            # Jika lebih dari timeout
+            if time_diff > ESP32_TIMEOUT_SECONDS:
+                if esp32_status['online']:
+                    print(f"⚠️ ESP32 TIMEOUT! Last seen {int(time_diff)}s ago")
+                    esp32_status['online'] = False
+            else:
+                # Jika dalam batas waktu dan statusnya false, set ke true
+                if not esp32_status['online']:
+                    print(f"✅ ESP32 BACK ONLINE!")
+                    esp32_status['online'] = True
+
+
+def get_esp32_realtime_status():
+    """
+    ✅ Helper function untuk mendapatkan status ESP32 secara realtime
+    Digunakan di berbagai endpoints
+    """
+    if not esp32_status['last_seen']:
+        return False, None
+    
+    time_diff = (get_current_wib_time() - esp32_status['last_seen']).total_seconds()
+    is_online = (time_diff < ESP32_TIMEOUT_SECONDS)
+    
+    return is_online, int(time_diff)
+
 
 def handle_chunked_image(data):
     """
@@ -999,19 +1042,23 @@ def get_data():
         cursor.close()
         conn.close()
         
+        # ✅ Get realtime ESP32 status
+        esp32_online, last_seen_ago = get_esp32_realtime_status()
+        
         response = {
             'motion': False,
             'totalDetections': status['total_detections'],
             'lastDetection': format_detection_time(last_record['detection_time']) if last_record else '-',
             'systemActive': bool(status['system_active']),
             'newDetection': False,
-            'timestamp': get_current_wib_time().strftime('%Y-%m-%d %H:%M:%S'),  # ✅ WIB time
+            'timestamp': get_current_wib_time().strftime('%Y-%m-%d %H:%M:%S'),
             'confidence': 85,
             'pestName': 'Unknown',
             'pestNames': [],
             'esp32Status': {
-                'online': esp32_status['online'],
+                'online': esp32_online,  # ✅ Realtime check
                 'lastSeen': esp32_status['last_seen'].strftime('%Y-%m-%d %H:%M:%S') if esp32_status['last_seen'] else None,
+                'lastSeenSecondsAgo': last_seen_ago,
                 'ldrValue': esp32_status['ldr_value'],
                 'totalCaptures': esp32_status['total_captures']
             }
@@ -1024,7 +1071,6 @@ def get_data():
                     response['motion'] = True
                     response['image'] = latest['image_base64']
                     response['id'] = latest['id']
-                    # ✅ WAKTU PENGAMBILAN GAMBAR
                     response['detectionTime'] = format_detection_time(latest['detection_time'])
                     response['confidence'] = int(float(latest['max_confidence']) * 100) if latest['max_confidence'] else 85
                     response['pestNames'] = pest_names
@@ -1041,7 +1087,6 @@ def get_data():
     except Exception as e:
         print(f"❌ Error /data: {e}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/api/history', methods=['GET'])
 def get_history():
@@ -1182,21 +1227,29 @@ def ping():
     except:
         db_ok = False
 
+    # ✅ Get realtime status
+    esp32_online, last_seen_ago = get_esp32_realtime_status()
+
     return jsonify({
         'status': 'online',
         'database': 'connected' if db_ok else 'error',
-        'timestamp': get_current_wib_time().isoformat(),  # ✅ WIB time
+        'timestamp': get_current_wib_time().isoformat(),
         'timezone': 'Asia/Jakarta (WIB/GMT+7)',
         'mqtt_connected': mqtt_connected,
         'mqtt_client_id': MQTT_CLIENT_ID,
         'roboflow_ready': roboflow_model is not None,
-        'esp32_online': esp32_status['online'],
+        'esp32_online': esp32_online,  # ✅ Realtime check
+        'esp32_last_seen': esp32_status['last_seen'].isoformat() if esp32_status['last_seen'] else None,
+        'esp32_last_seen_seconds_ago': last_seen_ago,
+        'esp32_timeout_threshold': ESP32_TIMEOUT_SECONDS,
         'chunked_sessions': len(chunk_storage)
     }), 200
 
-
 @app.route('/api/mqtt-status', methods=['GET'])
 def mqtt_status():
+    # ✅ Get realtime status
+    esp32_online, last_seen_ago = get_esp32_realtime_status()
+    
     return jsonify({
         'connected': mqtt_connected,
         'client_id': MQTT_CLIENT_ID,
@@ -1204,11 +1257,13 @@ def mqtt_status():
         'port': MQTT_PORT,
         'chunked_sessions_active': len(chunk_storage),
         'esp32_status': {
-            'online': esp32_status['online'],
+            'online': esp32_online,  # ✅ Realtime check
             'ldr_value': esp32_status['ldr_value'],
             'light_ok': esp32_status.get('light_ok', False),
             'total_captures': esp32_status['total_captures'],
-            'last_seen': esp32_status['last_seen'].isoformat() if esp32_status['last_seen'] else None
+            'last_seen': esp32_status['last_seen'].isoformat() if esp32_status['last_seen'] else None,
+            'last_seen_seconds_ago': last_seen_ago,
+            'timeout_threshold': ESP32_TIMEOUT_SECONDS
         }
     }), 200
 
@@ -1249,7 +1304,6 @@ def get_stats():
         """)
         pest_distribution = cursor.fetchall()
         
-        # ✅ Get last detection time
         cursor.execute("""
             SELECT detection_time 
             FROM detection_summary 
@@ -1261,6 +1315,9 @@ def get_stats():
         cursor.close()
         conn.close()
         
+        # ✅ Get realtime ESP32 status
+        esp32_online, last_seen_ago = get_esp32_realtime_status()
+        
         return jsonify({
             'total_detections': total,
             'today_detections': today,
@@ -1268,16 +1325,15 @@ def get_stats():
             'most_detected_count': top_pest['count'] if top_pest else 0,
             'pest_distribution': pest_distribution,
             'mqtt_connected': mqtt_connected,
-            'esp32_online': esp32_status['online'],
+            'esp32_online': esp32_online,  # ✅ Realtime check
+            'esp32_last_seen_seconds_ago': last_seen_ago,
             'chunked_sessions': len(chunk_storage),
-            # ✅ WAKTU DETECTION TERAKHIR
             'lastDetectionTime': format_detection_time(last_detection['detection_time']) if last_detection else None
         }), 200
         
     except Exception as e:
         print(f"❌ Error /api/stats: {e}")
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/api/detection/<int:summary_id>', methods=['GET'])
 def get_detection_by_id(summary_id):
@@ -1364,6 +1420,10 @@ cleanup_thread.start()
 
 session_cleanup_thread = threading.Thread(target=cleanup_old_sessions, daemon=True)
 session_cleanup_thread.start()
+esp32_timeout_thread = threading.Thread(target=check_esp32_timeout, daemon=True)
+esp32_timeout_thread.start()
+
+print("✅ ESP32 timeout monitor started")
 
 print("\n" + "="*60)
 if db_ok and roboflow_ok and mqtt_ok:
