@@ -85,7 +85,9 @@ esp32_status = {
     'online': False,
     'last_seen': None,
     'ldr_value': 0,
-    'total_captures': 0
+    'total_captures': 0,
+    'system_enabled': True,  # ✅ NEW
+    'camera_sleep_mode': False  # ✅ NEW
 }
 
 processed_messages = set()
@@ -236,9 +238,9 @@ def handle_chunked_image(data):
             print(f"   Capture number: {capture_number}")
             
             if timestamp_unix:
-                print(f"   Timestamp (Unix): {timestamp_unix}")
+                print(f"   📅 Unix Timestamp: {timestamp_unix}")
             if timestamp_str:
-                print(f"   Timestamp (String): {timestamp_str}")
+                print(f"   📅 WIB Time: {timestamp_str}")
             
             print(f"   Processing with Roboflow...")
             
@@ -504,10 +506,14 @@ def handle_status_message(data):
         'light_ok': data.get('light_ok', False),
         'total_captures': data.get('total_captures', 0),
         'wifi_rssi': data.get('wifi_rssi', 0),
-        'free_heap': data.get('free_heap', 0)
+        'free_heap': data.get('free_heap', 0),
+        'system_enabled': data.get('system_enabled', True),  # ✅ NEW
+        'camera_sleep_mode': data.get('camera_sleep_mode', False)  # ✅ NEW
     }
     
     print(f"   ESP32 Online: {esp32_status['online']}")
+    print(f"   System Enabled: {esp32_status['system_enabled']}")
+    print(f"   Camera Sleep: {esp32_status['camera_sleep_mode']}")
 
 def handle_detection_message(data):
     print(f"   Type: DETECTION (Direct Save)")
@@ -576,7 +582,7 @@ def publish_command(command):
         result = mqtt_client.publish(TOPIC_COMMAND, payload, qos=1)
         
         if result.rc == mqtt.MQTT_ERR_SUCCESS:
-            print(f"✅ Command published")
+            print(f"✅ Command published: {command}")
             return True
         else:
             print(f"❌ Publish failed: {result.rc}")
@@ -757,8 +763,6 @@ def save_detection_to_db_with_timestamp(image_base64, predictions, timestamp_val
             try:
                 if isinstance(timestamp_value, (int, float)):
                     # Unix timestamp dari ESP32
-                    # PROBLEM: ESP32 mungkin mengirim dalam UTC, kita perlu convert ke WIB
-                    # Solusi: Tambah 7 jam (WIB offset)
                     utc_time = datetime.utcfromtimestamp(timestamp_value)
                     detection_time = utc_time + WIB_OFFSET
                     print(f"   📅 UTC: {utc_time} -> WIB: {detection_time}")
@@ -854,33 +858,27 @@ def save_detection_to_db_direct(image_base64, pest_details, detection_time=None,
         # ✅ Convert Unix timestamp to datetime if needed (DENGAN TIMEZONE WIB)
         converted_time = None
         if detection_time:
-            # Check if it's a Unix timestamp (integer or numeric string)
             try:
                 if isinstance(detection_time, (int, float)):
-                    # Unix timestamp dari ESP32 (UTC) - convert ke WIB
                     utc_time = datetime.utcfromtimestamp(detection_time)
                     converted_time = utc_time + WIB_OFFSET
                     print(f"   📅 UTC: {utc_time} -> WIB: {converted_time}")
                     
                 elif isinstance(detection_time, str) and detection_time.isdigit():
-                    # Unix timestamp as string
                     utc_time = datetime.utcfromtimestamp(int(detection_time))
                     converted_time = utc_time + WIB_OFFSET
                     print(f"   📅 UTC (str): {utc_time} -> WIB: {converted_time}")
                     
                 elif isinstance(detection_time, str):
-                    # Already formatted string, parse it (anggap sudah WIB)
                     try:
                         converted_time = datetime.strptime(detection_time, '%Y-%m-%d %H:%M:%S')
                         print(f"   📅 Parsed datetime string: {detection_time}")
                     except ValueError:
-                        # If parsing fails, use current time
-                        converted_time = get_current_wib_time()  # ✅ WIB time
+                        converted_time = get_current_wib_time()
                         print(f"   ⚠️ Parse failed, using current WIB time")
                         
             except (ValueError, OSError) as e:
-                # Invalid timestamp, use current time
-                converted_time = get_current_wib_time()  # ✅ WIB time
+                converted_time = get_current_wib_time()
                 print(f"   ⚠️ Timestamp error: {e}, using current WIB time")
         
         if converted_time:
@@ -1056,11 +1054,13 @@ def get_data():
             'pestName': 'Unknown',
             'pestNames': [],
             'esp32Status': {
-                'online': esp32_online,  # ✅ Realtime check
+                'online': esp32_online,
                 'lastSeen': esp32_status['last_seen'].strftime('%Y-%m-%d %H:%M:%S') if esp32_status['last_seen'] else None,
                 'lastSeenSecondsAgo': last_seen_ago,
                 'ldrValue': esp32_status['ldr_value'],
-                'totalCaptures': esp32_status['total_captures']
+                'totalCaptures': esp32_status['total_captures'],
+                'systemEnabled': esp32_status['system_enabled'],  # ✅ NEW
+                'cameraSleepMode': esp32_status['camera_sleep_mode']  # ✅ NEW
             }
         }
         
@@ -1128,7 +1128,6 @@ def get_history():
                 except:
                     pest_names = ['Unknown']
             
-            # ✅ WAKTU PENGAMBILAN GAMBAR
             item['timestamp'] = format_detection_time(item['timestamp'])
             item['confidence'] = int(float(item['confidence']) * 100) if item['confidence'] else 85
             item['motionDetected'] = True
@@ -1216,6 +1215,115 @@ def delete_detection(summary_id):
         return jsonify({'success': False}), 500
 
 
+# ===== ✅ NEW ENDPOINTS: SYSTEM CONTROL =====
+
+@app.route('/api/system/control', methods=['POST'])
+def system_control():
+    """
+    ✅ NEW: Control sistem ESP32 (CAMERA SLEEP/WAKE + Database status)
+    Body: {"active": true/false}
+    - true: Resume camera + set system_active = true
+    - false: Sleep camera + set system_active = false
+    """
+    try:
+        data = request.json
+        
+        if 'active' not in data:
+            return jsonify({
+                'success': False,
+                'error': 'Missing "active" parameter'
+            }), 400
+        
+        system_active = bool(data['active'])
+        
+        # 1. Update database
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({
+                'success': False,
+                'error': 'Database error'
+            }), 500
+        
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE system_status 
+            SET system_active = %s, last_update = NOW()
+            WHERE id = 1
+        """, (system_active,))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        # 2. Send MQTT command to ESP32
+        mqtt_command = {
+            "action": "SYSTEM_CONTROL",
+            "active": system_active,
+            "timestamp": get_current_wib_time().isoformat()
+        }
+        
+        mqtt_success = False
+        if mqtt_connected:
+            mqtt_success = publish_command(mqtt_command)
+        
+        return jsonify({
+            'success': True,
+            'system_active': system_active,
+            'mqtt_sent': mqtt_success,
+            'message': f"System {'activated - camera resumed' if system_active else 'deactivated - camera sleeping'}"
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error /api/system/control: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@app.route('/api/system/status', methods=['GET'])
+def get_system_status():
+    """
+    ✅ NEW: Get current system status (from database + ESP32)
+    """
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({'error': 'Database error'}), 500
+        
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM system_status WHERE id = 1")
+        status = cursor.fetchone()
+        
+        cursor.close()
+        conn.close()
+        
+        if not status:
+            status = {'system_active': True, 'total_detections': 0}
+        
+        # Get realtime ESP32 status
+        esp32_online, last_seen_ago = get_esp32_realtime_status()
+        
+        return jsonify({
+            'success': True,
+            'system_active': bool(status['system_active']),
+            'total_detections': status['total_detections'],
+            'last_update': format_detection_time(status.get('last_update')),
+            'esp32_online': esp32_online,
+            'esp32_last_seen_seconds_ago': last_seen_ago,
+            'esp32_system_enabled': esp32_status['system_enabled'],
+            'esp32_camera_sleep_mode': esp32_status['camera_sleep_mode'],
+            'mqtt_connected': mqtt_connected
+        }), 200
+        
+    except Exception as e:
+        print(f"❌ Error /api/system/status: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 @app.route('/ping', methods=['GET'])
 def ping():
     db_ok = False
@@ -1238,10 +1346,12 @@ def ping():
         'mqtt_connected': mqtt_connected,
         'mqtt_client_id': MQTT_CLIENT_ID,
         'roboflow_ready': roboflow_model is not None,
-        'esp32_online': esp32_online,  # ✅ Realtime check
+        'esp32_online': esp32_online,
         'esp32_last_seen': esp32_status['last_seen'].isoformat() if esp32_status['last_seen'] else None,
         'esp32_last_seen_seconds_ago': last_seen_ago,
         'esp32_timeout_threshold': ESP32_TIMEOUT_SECONDS,
+        'esp32_system_enabled': esp32_status['system_enabled'],  # ✅ NEW
+        'esp32_camera_sleep_mode': esp32_status['camera_sleep_mode'],  # ✅ NEW
         'chunked_sessions': len(chunk_storage)
     }), 200
 
@@ -1257,13 +1367,15 @@ def mqtt_status():
         'port': MQTT_PORT,
         'chunked_sessions_active': len(chunk_storage),
         'esp32_status': {
-            'online': esp32_online,  # ✅ Realtime check
+            'online': esp32_online,
             'ldr_value': esp32_status['ldr_value'],
             'light_ok': esp32_status.get('light_ok', False),
             'total_captures': esp32_status['total_captures'],
             'last_seen': esp32_status['last_seen'].isoformat() if esp32_status['last_seen'] else None,
             'last_seen_seconds_ago': last_seen_ago,
-            'timeout_threshold': ESP32_TIMEOUT_SECONDS
+            'timeout_threshold': ESP32_TIMEOUT_SECONDS,
+            'system_enabled': esp32_status['system_enabled'],  # ✅ NEW
+            'camera_sleep_mode': esp32_status['camera_sleep_mode']  # ✅ NEW
         }
     }), 200
 
@@ -1325,8 +1437,10 @@ def get_stats():
             'most_detected_count': top_pest['count'] if top_pest else 0,
             'pest_distribution': pest_distribution,
             'mqtt_connected': mqtt_connected,
-            'esp32_online': esp32_online,  # ✅ Realtime check
+            'esp32_online': esp32_online,
             'esp32_last_seen_seconds_ago': last_seen_ago,
+            'esp32_system_enabled': esp32_status['system_enabled'],  # ✅ NEW
+            'esp32_camera_sleep_mode': esp32_status['camera_sleep_mode'],  # ✅ NEW
             'chunked_sessions': len(chunk_storage),
             'lastDetectionTime': format_detection_time(last_detection['detection_time']) if last_detection else None
         }), 200
@@ -1372,7 +1486,6 @@ def get_detection_by_id(summary_id):
         cursor.close()
         conn.close()
         
-        # ✅ WAKTU PENGAMBILAN GAMBAR
         response = {
             'id': detection['id'],
             'detectionTime': format_detection_time(detection['detection_time']),
@@ -1404,8 +1517,8 @@ def get_detection_by_id(summary_id):
 
 # ===== INITIALIZE ON STARTUP =====
 print("\n" + "="*60)
-print("  🐛 PEST DETECTION API - CHUNKED MODE")
-print("  Supports ESP32 Chunked + Python GUI Non-Chunked")
+print("  🐛 PEST DETECTION API - CAMERA SLEEP MODE")
+print("  ESP32 stays connected, camera can sleep")
 print("="*60)
 
 print("\n📦 Initializing...")
@@ -1420,6 +1533,7 @@ cleanup_thread.start()
 
 session_cleanup_thread = threading.Thread(target=cleanup_old_sessions, daemon=True)
 session_cleanup_thread.start()
+
 esp32_timeout_thread = threading.Thread(target=check_esp32_timeout, daemon=True)
 esp32_timeout_thread.start()
 
@@ -1445,11 +1559,13 @@ for i, (key, name) in enumerate(PEST_NAMES.items(), 1):
 print(f"\n📡 MQTT Config:")
 print(f"   Broker: {MQTT_BROKER}:{MQTT_PORT}")
 print(f"   Client: {MQTT_CLIENT_ID}")
-print(f"   Mode: Chunked + Non-Chunked")
-print(f"   Topics: {TOPIC_IMAGE}, {TOPIC_STATUS}, {TOPIC_DETECTION}")
+print(f"   Mode: Camera Sleep Control")
+print(f"   Topics: {TOPIC_IMAGE}, {TOPIC_STATUS}, {TOPIC_DETECTION}, {TOPIC_COMMAND}")
 
 print(f"\n🌐 API Endpoints:")
 print(f"   POST   /api/trigger-capture")
+print(f"   POST   /api/system/control        ✅ NEW")
+print(f"   GET    /api/system/status         ✅ NEW")
 print(f"   GET    /data")
 print(f"   GET    /api/history")
 print(f"   POST   /control")
