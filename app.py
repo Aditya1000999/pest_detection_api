@@ -62,14 +62,13 @@ CONFIDENCE_THRESHOLD = int(os.environ.get('CONFIDENCE_THRESHOLD', 40))
 
 # ===== PEST NAMES MAPPING =====
 PEST_NAMES = {
-    'bacterial_blight': 'Hawar Bakteri (Bacterial Blight)',
-    'blast': 'Blas (Blast)',
-    'brown_spot': 'Bercak Coklat (Brown Spot)',
-    'tungro': 'Tungro',
-    'Wereng_Daun': 'Wereng Daun',
+    'Whitebacked_Planthopper': 'Wereng Punggung Putih',
+    'bird': 'Burung (Bird)',
+    'caterpillar': 'Ulat (Caterpillar)',
+    'leafhoppers': 'Wereng Daun (Leafhoppers)',
+    'rat': 'Tikus (Rat)',
     'snail': 'Keong Mas (Snail)',
-    'kumbang_Penggerek': 'Kumbang Penggerek',
-    'rat': 'Tikus (Rat)'
+    'weevil': 'Kumbang Moncong (Weevil)'
 }
 
 ESP32_TIMEOUT_SECONDS = 5 # ESP32 dianggap offline setelah 5 detik
